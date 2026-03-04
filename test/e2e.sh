@@ -342,10 +342,38 @@ check_code "Access marks without login → 401" "401" \
   "$(curl -s -o /dev/null -w '%{http_code}' "$API/marks")"
 
 # ═══════════════════════════════════════════
-# 14. EDGE CASES
+# 14. COLLECTOR ADMIN ENDPOINTS
 # ═══════════════════════════════════════════
 echo ""
-echo "─── 14. Edge Cases ───"
+echo "─── 14. Collector Admin Endpoints ───"
+
+API_KEY="${API_KEY:-clawfeed_test_key_2026}"
+
+# Status without auth → 401
+check_code "Collect status without auth → 401" "401" \
+  "$(curl -s -o /dev/null -w '%{http_code}' "$API/collect/status")"
+
+# Status with auth → 200
+r=$(curl -s "$API/collect/status" -H "Authorization: Bearer $API_KEY")
+check "Collect status returns sources_active" 'sources_active' "$r"
+check "Collect status returns raw_items_total" 'raw_items_total' "$r"
+check "Collect status returns sources_due" 'sources_due' "$r"
+
+# Trigger without auth → 401
+check_code "Collect trigger without auth → 401" "401" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/collect/trigger")"
+
+# Trigger with auth → 200
+r=$(curl -s -X POST "$API/collect/trigger" -H "Authorization: Bearer $API_KEY")
+check "Collect trigger returns ok" '"ok":true' "$r"
+check "Collect trigger returns pid" 'pid' "$r"
+
+# ═══════════════════════════════════════════
+# 15. EDGE CASES
+# ═══════════════════════════════════════════
+echo ""
+echo "─── 15. Edge Cases ───"
+
 
 # Double-click install (idempotent)
 r=$(curl -s -X POST "$API/packs/$A_PACK/install" -H "$CAROL")
@@ -368,10 +396,10 @@ r=$(curl -s -X POST "$API/sources" -H "$ALICE" -H "Content-Type: application/jso
 echo "     Empty source name: $(echo "$r" | head -c 80) (TODO: add validation)"
 
 # ═══════════════════════════════════════════
-# 15. SOURCE DELETION CASCADE
+# 16. SOURCE DELETION CASCADE
 # ═══════════════════════════════════════════
 echo ""
-echo "─── 15. Source Deletion + Subscriber Impact ───"
+echo "─── 16. Source Deletion + Subscriber Impact ───"
 
 # Carol is subscribed to Alice's sources. Alice deletes one.
 CAROL_BEFORE=$(curl -s "$API/subscriptions" -H "$CAROL" | jq_len)
@@ -387,10 +415,10 @@ r=$(curl -s "$API/packs/$A_PACK")
 check "Pack still exists after source deleted" 'Alice AI Pack' "$r"
 
 # ═══════════════════════════════════════════
-# 16. SOFT DELETE
+# 17. SOFT DELETE
 # ═══════════════════════════════════════════
 echo ""
-echo "─── 16. Soft Delete ───"
+echo "─── 17. Soft Delete ───"
 
 # Create a source for soft delete testing
 SD_SRC=$(curl -s -X POST "$API/sources" -H "$ALICE" -H "Content-Type: application/json" \
@@ -435,6 +463,397 @@ check "16.6 Re-install deleted source pack → 0 added" '"added":0' "$r"
 # 16.7 Deleted source not counted in active sources
 r=$(curl -s "$API/sources")
 check_not "16.7 Deleted source not in active sources" 'SoftDel Test' "$r"
+
+# ═══════════════════════════════════════════
+# 17. Chat Widget API
+# ═══════════════════════════════════════════
+echo "17. Chat Widget API"
+
+# 17.1 POST /chat without auth → 401
+r=$(curl -s -X POST "$API/chat" -H "Content-Type: application/json" -d '{"message":"hello"}')
+check "17.1 Chat without auth → 401" '"login required"' "$r"
+
+# 17.2 POST /chat without message → 400
+r=$(curl -s -X POST "$API/chat" -H "Content-Type: application/json" -H "$ALICE" -d '{}')
+check "17.2 Chat without message → error" '"message required"' "$r"
+
+# 17.3 POST /chat with message → reply or 503 (if LLM not configured)
+r=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/chat" -H "Content-Type: application/json" -H "$ALICE" -d '{"message":"hello"}')
+if [ "$r" = "503" ]; then
+  TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); SKIP=$((SKIP+1))
+  printf "  ⏭️  17.3 Chat with message → 503 (LLM not configured, skipped)\n"
+elif [ "$r" = "200" ]; then
+  r2=$(curl -s -X POST "$API/chat" -H "Content-Type: application/json" -H "$ALICE" -d '{"message":"hello"}')
+  check "17.3 Chat with message → reply" '"reply"' "$r2"
+else
+  TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1))
+  printf "  ❌ 17.3 Chat with message → unexpected status %s\n" "$r"
+fi
+
+# 17.4 POST /chat with history (authed)
+r=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/chat" -H "Content-Type: application/json" -H "$ALICE" -d '{"message":"follow up","history":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"}]}')
+if [ "$r" = "200" ] || [ "$r" = "503" ]; then
+  TOTAL=$((TOTAL+1)); PASS=$((PASS+1))
+  printf "  ✅ 17.4 Chat with history → %s\n" "$r"
+else
+  TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1))
+  printf "  ❌ 17.4 Chat with history → unexpected %s\n" "$r"
+fi
+
+# 17.5 POST /chat with digest_id (authed)
+r=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/chat" -H "Content-Type: application/json" -H "$ALICE" -d '{"message":"summarize","digest_id":1}')
+if [ "$r" = "200" ] || [ "$r" = "503" ]; then
+  TOTAL=$((TOTAL+1)); PASS=$((PASS+1))
+  printf "  ✅ 17.5 Chat with digest_id → %s\n" "$r"
+else
+  TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1))
+  printf "  ❌ 17.5 Chat with digest_id → unexpected %s\n" "$r"
+fi
+
+# ═══════════════════════════════════════════
+# 18. Email Preferences
+# ═══════════════════════════════════════════
+echo ""
+echo "─── 18. Email Preferences ───"
+
+# 18.1 Get default (no pref set yet → off)
+r=$(curl -s "$API/email/preferences" -H "$ALICE")
+check "18.1 Default email pref is off" '"frequency":"off"' "$r"
+
+# 18.2 Anon → 401
+r=$(curl -s "$API/email/preferences")
+check "18.2 Anon → 401" '"error"' "$r"
+
+# 18.3 Set to daily
+r=$(curl -s -X PUT "$API/email/preferences" -H "$ALICE" -H "Content-Type: application/json" -d '{"frequency":"daily"}')
+check "18.3 Set daily" '"frequency":"daily"' "$r"
+
+# 18.4 Verify daily persisted
+r=$(curl -s "$API/email/preferences" -H "$ALICE")
+check "18.4 Verify daily" '"frequency":"daily"' "$r"
+
+# 18.5 Set to weekly
+r=$(curl -s -X PUT "$API/email/preferences" -H "$ALICE" -H "Content-Type: application/json" -d '{"frequency":"weekly"}')
+check "18.5 Set weekly" '"frequency":"weekly"' "$r"
+
+# 18.6 Invalid frequency → 400
+r=$(curl -s -X PUT "$API/email/preferences" -H "$ALICE" -H "Content-Type: application/json" -d '{"frequency":"hourly"}')
+check "18.6 Invalid freq → 400" '"error"' "$r"
+
+# 18.7 Unsubscribe via token
+# Get the token from DB
+UNSUB_TOKEN=$(sqlite3 "$AI_DIGEST_DB" "SELECT unsubscribe_token FROM email_preferences WHERE user_id=(SELECT id FROM users WHERE name='Alice (Test)') LIMIT 1" 2>/dev/null)
+if [ -n "$UNSUB_TOKEN" ]; then
+  r=$(curl -s -X POST "$API/email/unsubscribe?token=$UNSUB_TOKEN")
+  check "18.7 Unsubscribe via token" '"ok":true' "$r"
+
+  # 18.8 Verify unsubscribed
+  r=$(curl -s "$API/email/preferences" -H "$ALICE")
+  check "18.8 Verify unsubscribed → off" '"frequency":"off"' "$r"
+else
+  SKIP=$((SKIP+2))
+  echo "  ⏭ 18.7-18.8 Skipped (no token in DB)"
+fi
+
+# 18.9 Unsubscribe with bad token → 404
+r=$(curl -s -X POST "$API/email/unsubscribe?token=badtoken123")
+check "18.9 Bad token → 404" '"error"' "$r"
+
+# 18.10 Bob sets independently
+r=$(curl -s -X PUT "$API/email/preferences" -H "$BOB" -H "Content-Type: application/json" -d '{"frequency":"daily"}')
+check "18.10 Bob sets daily" '"frequency":"daily"' "$r"
+
+# 18.11 GET unsubscribe shows confirmation (does NOT modify state)
+if [ -n "$UNSUB_TOKEN" ]; then
+  # Re-enable first
+  curl -s -X PUT "$API/email/preferences" -H "$ALICE" -H "Content-Type: application/json" -d '{"frequency":"daily"}' > /dev/null
+  r=$(curl -s "$API/email/unsubscribe?token=$UNSUB_TOKEN")
+  check "18.11 GET unsubscribe → confirmation page" 'Unsubscribe from ClawFeed' "$r"
+
+  # 18.12 GET does NOT actually unsubscribe (prefetcher safety)
+  r=$(curl -s "$API/email/preferences" -H "$ALICE")
+  check "18.12 GET did not change pref (still daily)" '"frequency":"daily"' "$r"
+
+  # 18.13 POST actually unsubscribes
+  r=$(curl -s -X POST "$API/email/unsubscribe?token=$UNSUB_TOKEN")
+  check "18.13 POST unsubscribe executes" '"ok":true' "$r"
+
+  r=$(curl -s "$API/email/preferences" -H "$ALICE")
+  check "18.14 POST confirmed → off" '"frequency":"off"' "$r"
+else
+  SKIP=$((SKIP+1))
+  echo "  ⏭ 18.11 Skipped (no token)"
+fi
+
+# ═══════════════════════════════════════════
+# 19. Mark Enhancement (#12)
+# ═══════════════════════════════════════════
+echo ""
+echo "─── 19. Mark Enhancement ───"
+
+# Setup: create marks for Alice and Bob
+ME_MARK_A=$(curl -s -X POST "$API/marks" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"url":"https://test.local/ai-research","title":"AI Research Paper","note":"interesting findings"}' \
+  | jq_val "d.get('id','')")
+ME_MARK_B=$(curl -s -X POST "$API/marks" -H "$BOB" -H "Content-Type: application/json" \
+  -d '{"url":"https://test.local/bob-article","title":"Bob Article","note":"bob note"}' \
+  | jq_val "d.get('id','')")
+
+# 19.1 GET /api/marks/:id — get single mark
+if [ -n "$ME_MARK_A" ] && [ "$ME_MARK_A" != "None" ]; then
+  r=$(curl -s "$API/marks/$ME_MARK_A" -H "$ALICE")
+  check "19.1 Get single mark" 'AI Research Paper' "$r"
+
+  # 19.2 GET /api/marks/:id — other user → 404
+  r=$(curl -s -o /dev/null -w '%{http_code}' "$API/marks/$ME_MARK_A" -H "$BOB")
+  check_code "19.2 Other user cannot see mark → 404" "404" "$r"
+
+  # 19.3 GET /api/marks/:id — no auth → 401
+  check_code "19.3 No auth → 401" "401" \
+    "$(curl -s -o /dev/null -w '%{http_code}' "$API/marks/$ME_MARK_A")"
+
+  # 19.4 POST /api/marks/:id/analyze — LLM analysis
+  r=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/marks/$ME_MARK_A/analyze" -H "$ALICE")
+  if [ "$r" = "503" ]; then
+    TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); SKIP=$((SKIP+1))
+    printf "  ⏭️  19.4 Mark analyze → 503 (LLM not configured, skipped)\n"
+  elif [ "$r" = "200" ]; then
+    r2=$(curl -s -X POST "$API/marks/$ME_MARK_A/analyze" -H "$ALICE")
+    check "19.4 Mark analyze → has analysis" '"analysis"' "$r2"
+    check "19.4b Mark analyze → has tags" '"tags"' "$r2"
+  else
+    TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1))
+    printf "  ❌ 19.4 Mark analyze → unexpected %s\n" "$r"
+  fi
+
+  # 19.5 POST /api/marks/:id/share — create share link
+  r=$(curl -s -X POST "$API/marks/$ME_MARK_A/share" -H "$ALICE")
+  check "19.5 Create share link" '"share_token"' "$r"
+  SHARE_TOKEN=$(echo "$r" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('share_token',''))" 2>/dev/null || echo "")
+
+  # 19.6 GET shared mark (public, no auth)
+  if [ -n "$SHARE_TOKEN" ]; then
+    r=$(curl -s "$API/marks/shared/$SHARE_TOKEN")
+    check "19.6 Public shared mark accessible" 'AI Research Paper' "$r"
+    # Should NOT contain user_id
+    check_not "19.6b Shared mark hides user_id" '"user_id"' "$r"
+    check "19.6c Shared mark has shared_by" '"shared_by"' "$r"
+  else
+    TOTAL=$((TOTAL+3)); SKIP=$((SKIP+3))
+    echo "  ⏭️  19.6 Skipped (no share token)"
+  fi
+
+  # 19.7 Re-share same mark → same token (idempotent)
+  r=$(curl -s -X POST "$API/marks/$ME_MARK_A/share" -H "$ALICE")
+  if [ -n "$SHARE_TOKEN" ]; then
+    check "19.7 Re-share returns same token" "$SHARE_TOKEN" "$r"
+  else
+    TOTAL=$((TOTAL+1)); SKIP=$((SKIP+1))
+    echo "  ⏭️  19.7 Skipped (no token)"
+  fi
+
+  # 19.8 DELETE /api/marks/:id/share — revoke share
+  r=$(curl -s -X DELETE "$API/marks/$ME_MARK_A/share" -H "$ALICE")
+  check "19.8 Revoke share" '"ok":true' "$r"
+
+  # 19.9 Shared link no longer works after revoke
+  if [ -n "$SHARE_TOKEN" ]; then
+    r=$(curl -s -o /dev/null -w '%{http_code}' "$API/marks/shared/$SHARE_TOKEN")
+    check_code "19.9 Revoked share → 404" "404" "$r"
+  else
+    TOTAL=$((TOTAL+1)); SKIP=$((SKIP+1))
+    echo "  ⏭️  19.9 Skipped (no token)"
+  fi
+
+  # 19.10 Bob cannot share Alice's mark
+  r=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/marks/$ME_MARK_A/share" -H "$BOB")
+  check_code "19.10 Bob cannot share Alice's mark → 404" "404" "$r"
+else
+  echo "  ⏭️  19.1-19.10 Skipped (no mark ID)"
+  SKIP=$((SKIP+10))
+  TOTAL=$((TOTAL+10))
+fi
+
+# 19.11 GET /api/marks/export — markdown format
+r=$(curl -s -o /dev/null -w '%{http_code}' "$API/marks/export" -H "$ALICE")
+if [ "$r" = "200" ]; then
+  r2=$(curl -s "$API/marks/export" -H "$ALICE")
+  check "19.11 Export markdown contains header" 'ClawFeed Bookmarks' "$r2"
+else
+  check_code "19.11 Export endpoint accessible" "200" "$r"
+fi
+
+# 19.12 Export as JSON
+r=$(curl -s "$API/marks/export?format=json" -H "$ALICE")
+check "19.12 Export JSON is array" '[' "$r"
+
+# 19.13 Export without auth → 401
+check_code "19.13 Export no auth → 401" "401" \
+  "$(curl -s -o /dev/null -w '%{http_code}' "$API/marks/export")"
+
+# 19.14 GET /api/marks/shared with invalid token → 404
+check_code "19.14 Invalid share token → 404" "404" \
+  "$(curl -s -o /dev/null -w '%{http_code}' "$API/marks/shared/00000000000000000000000000000000")"
+
+# 19.15 Analyze without auth → 401
+if [ -n "$ME_MARK_A" ] && [ "$ME_MARK_A" != "None" ]; then
+  check_code "19.15 Analyze no auth → 401" "401" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/marks/$ME_MARK_A/analyze")"
+fi
+
+# Cleanup
+if [ -n "$ME_MARK_A" ] && [ "$ME_MARK_A" != "None" ]; then
+  curl -s -X DELETE "$API/marks/$ME_MARK_A" -H "$ALICE" > /dev/null
+fi
+if [ -n "$ME_MARK_B" ] && [ "$ME_MARK_B" != "None" ]; then
+  curl -s -X DELETE "$API/marks/$ME_MARK_B" -H "$BOB" > /dev/null
+fi
+
+# ═══════════════════════════════════════════
+# 20. DIGEST QUALITY — weights, feedback, topics (#13)
+# ═══════════════════════════════════════════
+echo ""
+echo "─── 20. Digest Quality (weights, feedback, topics) ───"
+
+# 20.1 Source weights — list (default all 1.0)
+r=$(curl -s "$API/subscriptions/weights" -H "$ALICE")
+check "20.1 Weights list" '"weight"' "$r"
+
+# 20.2 Set weight for a source
+# Get Alice's first subscription source ID
+A_FIRST_SRC=$(sqlite3 "$AI_DIGEST_DB" "SELECT source_id FROM user_subscriptions WHERE user_id=(SELECT id FROM users WHERE name='Alice (Test)') LIMIT 1" 2>/dev/null)
+if [ -n "$A_FIRST_SRC" ]; then
+  r=$(curl -s -X PUT "$API/subscriptions/weights" -H "$ALICE" -H "Content-Type: application/json" \
+    -d "{\"sourceId\":$A_FIRST_SRC,\"weight\":2.5}")
+  check "20.2 Set weight 2.5" '"ok":true' "$r"
+
+  # 20.3 Verify weight persisted
+  r=$(curl -s "$API/subscriptions/weights" -H "$ALICE")
+  check "20.3 Weight = 2.5" '2.5' "$r"
+else
+  SKIP=$((SKIP+2))
+  echo "  ⏭ 20.2-20.3 Skipped (no subscriptions)"
+fi
+
+# 20.4 Invalid weight → 400
+r=$(curl -s -X PUT "$API/subscriptions/weights" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"sourceId":1,"weight":10}')
+check "20.4 Weight > 5 → 400" '"error"' "$r"
+
+# 20.5 Weight without sourceId → 400
+r=$(curl -s -X PUT "$API/subscriptions/weights" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"weight":1.0}')
+check "20.5 No sourceId → 400" '"error"' "$r"
+
+# 20.6 Visitor can't set weight
+r=$(curl -s -X PUT "$API/subscriptions/weights" -H "Content-Type: application/json" \
+  -d '{"sourceId":1,"weight":1.0}')
+check "20.6 Visitor → 401" '"error"' "$r"
+
+# ── Item Feedback ──
+
+# 20.7 Submit helpful feedback
+r=$(curl -s -X POST "$API/item-feedback" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"itemUrl":"https://example.com/great-article","itemTitle":"Great Article","signal":"helpful"}')
+check "20.7 Helpful feedback" '"ok":true' "$r"
+
+# 20.8 Submit not_helpful feedback
+r=$(curl -s -X POST "$API/item-feedback" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"itemUrl":"https://example.com/bad-article","itemTitle":"Bad Article","signal":"not_helpful"}')
+check "20.8 Not helpful feedback" '"ok":true' "$r"
+
+# 20.9 List feedback
+r=$(curl -s "$API/item-feedback" -H "$ALICE")
+check "20.9 List feedback" '"helpful"' "$r"
+check "20.9b List feedback (2 items)" '"not_helpful"' "$r"
+
+# 20.10 Feedback summary
+r=$(curl -s "$API/item-feedback/summary" -H "$ALICE")
+check "20.10 Feedback summary" '"count"' "$r"
+
+# 20.11 Invalid signal → 400
+r=$(curl -s -X POST "$API/item-feedback" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"itemUrl":"https://x.com/foo","signal":"maybe"}')
+check "20.11 Invalid signal → 400" '"error"' "$r"
+
+# 20.12 Missing itemUrl → 400
+r=$(curl -s -X POST "$API/item-feedback" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"signal":"helpful"}')
+check "20.12 No itemUrl → 400" '"error"' "$r"
+
+# 20.13 Upsert: change signal
+r=$(curl -s -X POST "$API/item-feedback" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"itemUrl":"https://example.com/great-article","signal":"not_helpful"}')
+check "20.13 Upsert feedback" '"ok":true' "$r"
+
+# 20.14 Visitor can't submit feedback
+r=$(curl -s -X POST "$API/item-feedback" -H "Content-Type: application/json" \
+  -d '{"itemUrl":"https://x.com/foo","signal":"helpful"}')
+check "20.14 Visitor → 401" '"error"' "$r"
+
+# 20.15 Bob can't see Alice's feedback
+r=$(curl -s "$API/item-feedback" -H "$BOB")
+check_not "20.15 Data isolation" 'great-article' "$r"
+
+# ── Topics ──
+
+# 20.16 Add topic
+r=$(curl -s -X POST "$API/topics" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"topic":"AI Research","score":2.0}')
+check "20.16 Add topic" '"ok":true' "$r"
+
+# 20.17 Add another topic
+r=$(curl -s -X POST "$API/topics" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"topic":"Rust Programming"}')
+check "20.17 Add topic (default score)" '"ok":true' "$r"
+
+# 20.18 List topics
+r=$(curl -s "$API/topics" -H "$ALICE")
+check "20.18 List topics" '"ai research"' "$r"
+check "20.18b Second topic" '"rust programming"' "$r"
+
+# 20.19 Update topic score (upsert)
+r=$(curl -s -X POST "$API/topics" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"topic":"AI Research","score":3.5}')
+check "20.19 Upsert topic" '"ok":true' "$r"
+
+# 20.20 Delete topic
+r=$(curl -s -X DELETE "$API/topics/rust%20programming" -H "$ALICE")
+check "20.20 Delete topic" '"ok":true' "$r"
+
+# 20.21 Verify deletion
+r=$(curl -s "$API/topics" -H "$ALICE")
+check_not "20.21 Topic removed" 'rust programming' "$r"
+
+# 20.22 Empty topic → 400
+r=$(curl -s -X POST "$API/topics" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"topic":""}')
+check "20.22 Empty topic → 400" '"error"' "$r"
+
+# 20.23 Topic too long → 400
+LONG_TOPIC=$(python3 -c "print('x' * 101)")
+r=$(curl -s -X POST "$API/topics" -H "$ALICE" -H "Content-Type: application/json" \
+  -d "{\"topic\":\"$LONG_TOPIC\"}")
+check "20.23 Long topic → 400" '"error"' "$r"
+
+# 20.24 Visitor can't add topic
+r=$(curl -s -X POST "$API/topics" -H "Content-Type: application/json" \
+  -d '{"topic":"whatever"}')
+check "20.24 Visitor → 401" '"error"' "$r"
+
+# 20.25 Bob can't see Alice's topics
+r=$(curl -s "$API/topics" -H "$BOB")
+check_not "20.25 Topic isolation" 'ai research' "$r"
+
+# 20.26 Invalid weight (negative) → 400
+r=$(curl -s -X PUT "$API/subscriptions/weights" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"sourceId":1,"weight":-1}')
+check "20.26 Negative weight → 400" '"error"' "$r"
+
+# 20.27 Score out of range → 400
+r=$(curl -s -X POST "$API/topics" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"topic":"test","score":10}')
+check "20.27 Score > 5 → 400" '"error"' "$r"
 
 # ═══════════════════════════════════════════
 # RESULTS

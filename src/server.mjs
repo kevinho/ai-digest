@@ -4,10 +4,11 @@ import https from 'https';
 import { readFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { randomBytes, createHmac, timingSafeEqual } from 'crypto';
+import { randomBytes, createHmac, timingSafeEqual, createHash } from 'crypto';
 import { lookup } from 'dns/promises';
 import { isIP } from 'net';
-import { getDb, listDigests, getDigest, createDigest, listMarks, createMark, deleteMark, getConfig, setConfig, upsertUser, createSession, getSession, deleteSession, listSources, getSource, createSource, updateSource, deleteSource, getSourceByTypeConfig, getUserBySlug, listDigestsByUser, countDigestsByUser, createPack, getPack, getPackBySlug, listPacks, incrementPackInstall, deletePack, listSubscriptions, subscribe, unsubscribe, bulkSubscribe, isSubscribed, createFeedback, getUserFeedback, getAllFeedback, replyToFeedback, updateFeedbackStatus, markFeedbackRead, getUnreadFeedbackCount } from './db.mjs';
+import { getDb, listDigests, getDigest, createDigest, listMarks, createMark, deleteMark, getConfig, setConfig, upsertUser, createSession, getSession, deleteSession, listSources, getSource, createSource, updateSource, deleteSource, getSourceByTypeConfig, getUserBySlug, listDigestsByUser, countDigestsByUser, createPack, getPack, getPackBySlug, listPacks, incrementPackInstall, deletePack, listSubscriptions, subscribe, unsubscribe, bulkSubscribe, isSubscribed, createFeedback, getUserFeedback, getAllFeedback, replyToFeedback, updateFeedbackStatus, markFeedbackRead, getUnreadFeedbackCount, listRawItems, getRawItemStats, listRawItemsForDigest, getCollectorStatus, getActiveSubscriptionSourceIds, getLastDigestTime, getEmailPreference, upsertEmailPreference, getEmailPrefByToken, getTelegramLink, consumeLinkCode, saveTelegramLink, removeTelegramLink, updateTelegramPrefs, getMark, updateMarkAnalysis, setMarkShareToken, getMarkByShareToken, revokeMarkShare, listMarksForExport, getUserMarkTopics, getSubscriptionWeights, setSubscriptionWeight, upsertItemFeedback, getItemFeedback, getItemFeedbackSummary, upsertUserTopic, removeUserTopic, getUserTopics, createWebhook, listWebhooks, getWebhook, updateWebhook, deleteWebhook, getActiveWebhooksForEvent, logWebhookDelivery, createApiKey, getApiKeyByHash, listApiKeys, revokeApiKey, touchApiKeyUsed } from './db.mjs';
+import { fork } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
@@ -34,8 +35,58 @@ const OAUTH_STATE_SECRET = env.OAUTH_STATE_SECRET || process.env.OAUTH_STATE_SEC
 const MAX_BODY_BYTES = 1024 * 1024;
 const DB_PATH = process.env.DIGEST_DB || join(ROOT, 'data', 'digest.db');
 
+// ── Chat (LLM) config ──
+const LLM_API_URL = process.env.LLM_API_URL || env.LLM_API_URL || 'https://api.openai.com/v1/chat/completions';
+const LLM_API_KEY = process.env.LLM_API_KEY || env.LLM_API_KEY || '';
+const LLM_MODEL = process.env.LLM_MODEL || env.LLM_MODEL || 'gpt-4o-mini';
+const LLM_TIMEOUT = parseInt(process.env.LLM_TIMEOUT || env.LLM_TIMEOUT || '90', 10) * 1000;
+
 mkdirSync(join(ROOT, 'data'), { recursive: true });
 const db = getDb(DB_PATH);
+
+// Rate limiting (in-memory, per user)
+const chatRateLimit = new Map();
+const analyzeRateLimit = new Map();
+
+// ── Shared LLM helper ──
+function callLlmApi(messages, { maxTokens = 1024, temperature = 0.3 } = {}) {
+  return new Promise((resolve, reject) => {
+    if (!LLM_API_KEY) return reject(new Error('LLM not configured'));
+    const url = new URL(LLM_API_URL);
+    const payload = JSON.stringify({
+      model: LLM_MODEL,
+      messages,
+      max_tokens: maxTokens,
+      temperature,
+    });
+    const mod = url.protocol === 'https:' ? https : http;
+    const llmReq = mod.request(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${LLM_API_KEY}`,
+        'Content-Length': Buffer.byteLength(payload),
+      },
+    }, (resp) => {
+      let data = '';
+      const MAX_RESP = 64 * 1024;
+      resp.on('data', c => { data += c; if (data.length > MAX_RESP) { resp.destroy(); reject(new Error('response too large')); } });
+      resp.on('end', () => {
+        clearTimeout(timer);
+        try {
+          const j = JSON.parse(data);
+          if (resp.statusCode !== 200) return reject(new Error(j.error?.message || 'LLM error'));
+          resolve(j.choices?.[0]?.message?.content || '');
+        } catch (e) { reject(e); }
+      });
+    });
+    const timer = setTimeout(() => { llmReq.destroy(); reject(new Error('timeout')); }, LLM_TIMEOUT);
+    llmReq.on('error', e => { clearTimeout(timer); reject(e); });
+    llmReq.on('close', () => clearTimeout(timer));
+    llmReq.write(payload);
+    llmReq.end();
+  });
+}
 
 function json(res, data, status = 200) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -190,8 +241,9 @@ function httpsPost(url, body) {
   });
 }
 
-// Auth middleware: attach req.user if valid session
+// Auth middleware: attach req.user if valid session or API key
 function attachUser(req) {
+  // 1. Session cookie
   const cookies = parseCookies(req);
   const sessionVal = cookies[COOKIE_NAME];
   if (sessionVal) {
@@ -199,6 +251,66 @@ function attachUser(req) {
     if (sess) {
       req.user = { id: sess.uid, email: sess.email, name: sess.name, avatar: sess.avatar, slug: sess.slug };
       req.sessionId = sessionVal;
+      return;
+    }
+  }
+  // 2. Bearer API key (cf_key_* or clawfeed_* prefix)
+  const authHeader = req.headers.authorization || '';
+  if (authHeader.startsWith('Bearer cf_') || authHeader.startsWith('Bearer clawfeed_')) {
+    const rawKey = authHeader.slice(7);
+    const keyHash = createHash('sha256').update(rawKey).digest('hex');
+    const keyRow = getApiKeyByHash(db, keyHash);
+    if (keyRow) {
+      req.user = { id: keyRow.uid, email: keyRow.email, name: keyRow.user_name, avatar: null, slug: keyRow.slug };
+      req.apiKeyId = keyRow.id;
+      req.apiKeyScopes = JSON.parse(keyRow.scopes || '["read"]');
+      touchApiKeyUsed(db, keyRow.id);
+    }
+  }
+}
+
+// ── Webhook delivery helper ──
+async function deliverWebhook(event, payload) {
+  const hooks = getActiveWebhooksForEvent(db, event);
+  for (const hook of hooks) {
+    const body = JSON.stringify({ event, data: payload, delivered_at: new Date().toISOString() });
+    const sig = createHmac('sha256', hook.secret).update(body).digest('hex');
+    try {
+      const u = new URL(hook.url);
+      await assertSafeFetchUrl(hook.url);
+      const mod = u.protocol === 'https:' ? https : http;
+      await new Promise((resolve) => {
+        const req = mod.request(u, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body),
+            'X-ClawFeed-Event': event,
+            'X-ClawFeed-Signature': `sha256=${sig}`,
+          },
+          timeout: 10000,
+        }, (resp) => {
+          let respBody = '';
+          resp.on('data', c => { respBody += c; if (respBody.length > 4096) resp.destroy(); });
+          resp.on('end', () => {
+            logWebhookDelivery(db, hook.id, event, payload, resp.statusCode, respBody.slice(0, 500), null);
+            resolve();
+          });
+        });
+        req.on('error', (e) => {
+          logWebhookDelivery(db, hook.id, event, payload, null, null, e.message);
+          resolve();
+        });
+        req.on('timeout', () => {
+          req.destroy();
+          logWebhookDelivery(db, hook.id, event, payload, null, null, 'timeout');
+          resolve();
+        });
+        req.write(body);
+        req.end();
+      });
+    } catch (e) {
+      logWebhookDelivery(db, hook.id, event, payload, null, null, e.message);
     }
   }
 }
@@ -515,9 +627,31 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'GET' && path === '/api/digests') {
       const type = params.get('type') || undefined;
-      const limit = parseInt(params.get('limit') || '20');
-      const offset = parseInt(params.get('offset') || '0');
+      const limit = parseInt(params.get('limit') || '20', 10);
+      const offset = parseInt(params.get('offset') || '0', 10);
+      if (req.user && params.get('mine') !== '0') {
+        // Logged-in: show user's own digests + system fallback
+        const digests = listDigestsByUser(db, req.user.id, { type, limit });
+        if (digests.length) return json(res, digests);
+        // New user with no personal digests yet — fall back to system digests
+        return json(res, listDigests(db, { type, limit, offset }));
+      }
+      // Anonymous or explicit mine=0: show system digests only
       return json(res, listDigests(db, { type, limit, offset }));
+    }
+
+    // GET /api/digest-status — check if user has personalized digests
+    if (req.method === 'GET' && path === '/api/digest-status') {
+      if (!req.user) return json(res, { personalized: false, reason: 'not_logged_in' });
+      const sourceIds = getActiveSubscriptionSourceIds(db, req.user.id);
+      if (!sourceIds.length) return json(res, { personalized: false, reason: 'no_subscriptions' });
+      const lastDigest = getLastDigestTime(db, req.user.id, params.get('type') || '4h');
+      return json(res, {
+        personalized: !!lastDigest,
+        subscriptions: sourceIds.length,
+        last_digest: lastDigest,
+        reason: lastDigest ? 'ready' : 'pending_generation',
+      });
     }
 
     const digestMatch = path.match(/^\/api\/digests\/(\d+)$/);
@@ -579,6 +713,154 @@ const server = createServer(async (req, res) => {
       return json(res, { tweets: marks.filter(m => m.status === 'pending').map(m => ({ url: m.url, markedAt: m.created_at })), history });
     }
 
+    // ── Mark Enhancement endpoints (#12) ──
+
+    // GET /api/marks/:id — get single mark with analysis
+    const markGetMatch = path.match(/^\/api\/marks\/(\d+)$/);
+    if (req.method === 'GET' && markGetMatch) {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      const mark = getMark(db, parseInt(markGetMatch[1]), req.user.id);
+      if (!mark) return json(res, { error: 'mark not found' }, 404);
+      return json(res, mark);
+    }
+
+    // POST /api/marks/:id/analyze — trigger AI analysis for a mark
+    // Rate limit: 5 requests per minute per user (M-1: prevent LLM quota abuse)
+    const markAnalyzeMatch = path.match(/^\/api\/marks\/(\d+)\/analyze$/);
+    if (req.method === 'POST' && markAnalyzeMatch) {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      if (!LLM_API_KEY) return json(res, { error: 'analysis not configured' }, 503);
+      const now = Date.now();
+      const uid = req.user.id;
+      if (!analyzeRateLimit.has(uid)) analyzeRateLimit.set(uid, []);
+      const ts = analyzeRateLimit.get(uid).filter(t => now - t < 60000);
+      if (ts.length >= 5) return json(res, { error: 'rate limit exceeded, try again later' }, 429);
+      ts.push(now);
+      analyzeRateLimit.set(uid, ts);
+      const markId = parseInt(markAnalyzeMatch[1]);
+      const mark = getMark(db, markId, req.user.id);
+      if (!mark) return json(res, { error: 'mark not found' }, 404);
+
+      try {
+        // User-supplied title/note/URL are interpolated into the prompt. Prompt injection
+        // risk is low: analysis is stored in the user's own mark and only shared if the
+        // user explicitly creates a share link (user-initiated action).
+        const analysisPrompt = `Analyze this bookmarked article and provide a structured analysis.
+
+Title: ${(mark.title || '').slice(0, 200)}
+URL: ${(mark.url || '').slice(0, 500)}
+User note: ${(mark.note || '').slice(0, 500)}
+
+Provide:
+1. **Summary** — 2-3 sentence overview of the content based on the title and URL
+2. **Key Topics** — list 3-5 topic tags (single words or short phrases, lowercase)
+3. **Why It Matters** — brief explanation of significance/relevance
+4. **Related Topics** — 2-3 related areas worth exploring
+
+Format the analysis in clear markdown. Return the topic tags as a JSON array on a separate line prefixed with "TAGS:" (e.g., TAGS: ["ai", "machine-learning", "research"])`;
+
+        const result = await callLlmApi([
+          { role: 'system', content: 'You are a knowledgeable content analyst. Provide concise, insightful analysis.' },
+          { role: 'user', content: analysisPrompt },
+        ], { maxTokens: 1024, temperature: 0.3 });
+
+        // Extract tags from response
+        let tags = '[]';
+        const tagMatch = result.match(/TAGS:\s*(\[.*?\])/);
+        if (tagMatch) {
+          try { tags = JSON.stringify(JSON.parse(tagMatch[1])); } catch {}
+        }
+        const analysis = result.replace(/TAGS:\s*\[.*?\]/, '').trim();
+
+        updateMarkAnalysis(db, markId, analysis, tags);
+        const updated = getMark(db, markId, req.user.id);
+        return json(res, updated);
+      } catch (e) {
+        console.error('Mark analysis error:', e.message);
+        return json(res, { error: 'Analysis failed' }, 502);
+      }
+    }
+
+    // POST /api/marks/:id/share — generate share link
+    const markShareMatch = path.match(/^\/api\/marks\/(\d+)\/share$/);
+    if (req.method === 'POST' && markShareMatch) {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      const markId = parseInt(markShareMatch[1]);
+      const mark = getMark(db, markId, req.user.id);
+      if (!mark) return json(res, { error: 'mark not found' }, 404);
+
+      if (mark.share_token) {
+        return json(res, { share_token: mark.share_token, url: `/api/marks/shared/${mark.share_token}` });
+      }
+
+      const token = randomBytes(16).toString('hex');
+      setMarkShareToken(db, markId, token);
+      return json(res, { share_token: token, url: `/api/marks/shared/${token}` });
+    }
+
+    // DELETE /api/marks/:id/share — revoke share link (L-1: reuse markShareMatch)
+    if (req.method === 'DELETE' && markShareMatch) {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      const markId = parseInt(markShareMatch[1]);
+      revokeMarkShare(db, markId, req.user.id);
+      return json(res, { ok: true });
+    }
+
+    // GET /api/marks/shared/:token — public access to shared mark
+    const sharedMarkMatch = path.match(/^\/api\/marks\/shared\/([a-f0-9]{32})$/);
+    if (req.method === 'GET' && sharedMarkMatch) {
+      const mark = getMarkByShareToken(db, sharedMarkMatch[1]);
+      if (!mark) return json(res, { error: 'not found' }, 404);
+      // Return only safe fields (no user_id, no internal IDs)
+      return json(res, {
+        title: mark.title,
+        url: mark.url,
+        note: mark.note,
+        analysis: mark.analysis,
+        tags: mark.tags,
+        shared_by: mark.user_name || 'Anonymous',
+        created_at: mark.created_at,
+        analyzed_at: mark.analyzed_at,
+      });
+    }
+
+    // GET /api/marks/export — export marks as markdown
+    if (req.method === 'GET' && path === '/api/marks/export') {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      const format = params.get('format') || 'markdown';
+      const status = params.get('status') || undefined;
+      const since = params.get('since') || undefined;
+      const until = params.get('until') || undefined;
+      const marks = listMarksForExport(db, req.user.id, { status, since, until });
+
+      if (format === 'json') {
+        return json(res, marks);
+      }
+
+      // Default: markdown
+      let md = `# ClawFeed Bookmarks\n\nExported: ${new Date().toISOString()}\nTotal: ${marks.length} items\n\n---\n\n`;
+      for (const m of marks) {
+        md += `## ${m.title || '(untitled)'}\n\n`;
+        md += `- **URL:** ${m.url}\n`;
+        md += `- **Saved:** ${m.created_at}\n`;
+        if (m.note) md += `- **Note:** ${m.note}\n`;
+        if (m.tags && m.tags !== '[]') {
+          try {
+            const tags = JSON.parse(m.tags);
+            if (tags.length) md += `- **Tags:** ${tags.join(', ')}\n`;
+          } catch {}
+        }
+        if (m.analysis) md += `\n### Analysis\n\n${m.analysis}\n`;
+        md += '\n---\n\n';
+      }
+
+      res.writeHead(200, {
+        'Content-Type': 'text/markdown; charset=utf-8',
+        'Content-Disposition': `attachment; filename="clawfeed-bookmarks-${new Date().toISOString().slice(0, 10)}.md"`,
+      });
+      return res.end(md);
+    }
+
     // ── Subscriptions endpoints ──
 
     if (req.method === 'GET' && path === '/api/subscriptions') {
@@ -609,6 +891,79 @@ const server = createServer(async (req, res) => {
     if (req.method === 'DELETE' && subMatch) {
       if (!req.user) return json(res, { error: 'not authenticated' }, 401);
       unsubscribe(db, req.user.id, parseInt(subMatch[1]));
+      return json(res, { ok: true });
+    }
+
+    // ── Source Weights ──
+
+    if (req.method === 'GET' && path === '/api/subscriptions/weights') {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      return json(res, getSubscriptionWeights(db, req.user.id));
+    }
+
+    if (req.method === 'PUT' && path === '/api/subscriptions/weights') {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      const body = await parseBody(req);
+      const { sourceId, weight } = body;
+      if (!sourceId) return json(res, { error: 'sourceId required' }, 400);
+      const sid = parseInt(sourceId, 10);
+      if (isNaN(sid)) return json(res, { error: 'sourceId must be a number' }, 400);
+      const w = parseFloat(weight);
+      if (isNaN(w) || w < 0 || w > 5) return json(res, { error: 'weight must be 0-5' }, 400);
+      const result = setSubscriptionWeight(db, req.user.id, sid, w);
+      if (!result.changes) return json(res, { error: 'subscription not found' }, 404);
+      return json(res, { ok: true, sourceId: sid, weight: w });
+    }
+
+    // ── Item Feedback ──
+
+    if (req.method === 'GET' && path === '/api/item-feedback') {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      const limit = Math.min(parseInt(params.get('limit') || '50', 10), 200);
+      return json(res, getItemFeedback(db, req.user.id, { limit }));
+    }
+
+    if (req.method === 'GET' && path === '/api/item-feedback/summary') {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      return json(res, getItemFeedbackSummary(db, req.user.id));
+    }
+
+    if (req.method === 'POST' && path === '/api/item-feedback') {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      const body = await parseBody(req);
+      const { itemUrl, itemTitle, signal } = body;
+      if (!itemUrl) return json(res, { error: 'itemUrl required' }, 400);
+      if (typeof itemUrl !== 'string' || itemUrl.length > 2048) return json(res, { error: 'itemUrl too long (max 2048)' }, 400);
+      if (itemTitle && (typeof itemTitle !== 'string' || itemTitle.length > 500)) return json(res, { error: 'itemTitle too long (max 500)' }, 400);
+      if (!signal || !['helpful', 'not_helpful'].includes(signal)) return json(res, { error: 'signal must be helpful or not_helpful' }, 400);
+      upsertItemFeedback(db, req.user.id, itemUrl, (itemTitle || '').slice(0, 500), signal);
+      return json(res, { ok: true });
+    }
+
+    // ── User Topics ──
+
+    if (req.method === 'GET' && path === '/api/topics') {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      return json(res, getUserTopics(db, req.user.id));
+    }
+
+    if (req.method === 'POST' && path === '/api/topics') {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      const body = await parseBody(req);
+      const { topic, score } = body;
+      if (!topic || typeof topic !== 'string' || !topic.trim()) return json(res, { error: 'topic required' }, 400);
+      if (topic.trim().length > 100) return json(res, { error: 'topic too long' }, 400);
+      const s = score !== undefined && score !== null ? parseFloat(score) : 1.0;
+      if (isNaN(s) || s < 0 || s > 5) return json(res, { error: 'score must be 0-5' }, 400);
+      upsertUserTopic(db, req.user.id, topic.trim(), s, 'manual');
+      return json(res, { ok: true });
+    }
+
+    if (req.method === 'DELETE' && path.startsWith('/api/topics/')) {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      const topic = decodeURIComponent(path.slice('/api/topics/'.length));
+      if (!topic) return json(res, { error: 'topic required' }, 400);
+      removeUserTopic(db, req.user.id, topic);
       return json(res, { ok: true });
     }
 
@@ -821,6 +1176,62 @@ const server = createServer(async (req, res) => {
       return json(res, { ok: true });
     }
 
+    // ── Raw Items endpoints ──
+
+    if (req.method === 'GET' && path === '/api/raw-items') {
+      if (!req.user) return json(res, { error: 'login required' }, 401);
+      // Scope to user's subscribed sources only (no cross-user source access)
+      const subs = listSubscriptions(db, req.user.id);
+      const userSourceIds = new Set(subs.filter(s => !s.is_deleted).map(s => s.id));
+      const sourceId = params.get('source_id') ? parseInt(params.get('source_id'), 10) : undefined;
+      if (sourceId && !userSourceIds.has(sourceId)) return json(res, { error: 'source not found' }, 404);
+      const since = params.get('since') || undefined;
+      const limit = Math.min(parseInt(params.get('limit') || '50', 10), 200);
+      const offset = parseInt(params.get('offset') || '0', 10);
+      const effectiveSourceId = sourceId || undefined;
+      const items = listRawItems(db, { sourceId: effectiveSourceId, since, limit, offset });
+      return json(res, effectiveSourceId ? items : items.filter(i => userSourceIds.has(i.source_id)));
+    }
+
+    if (req.method === 'GET' && path === '/api/raw-items/stats') {
+      if (!req.user) return json(res, { error: 'login required' }, 401);
+      const subs = listSubscriptions(db, req.user.id);
+      const userSourceIds = new Set(subs.filter(s => !s.is_deleted).map(s => s.id));
+      const stats = getRawItemStats(db);
+      return json(res, stats.filter(s => userSourceIds.has(s.source_id)));
+    }
+
+    if (req.method === 'GET' && path === '/api/raw-items/for-digest') {
+      if (!req.user) return json(res, { error: 'login required' }, 401);
+      const subs = listSubscriptions(db, req.user.id);
+      const sourceIds = subs.filter(s => !s.is_deleted).map(s => s.id);
+      const since = params.get('since') || undefined;
+      const limit = Math.min(parseInt(params.get('limit') || '200'), 500);
+      return json(res, listRawItemsForDigest(db, sourceIds, { since, limit }));
+    }
+
+    // ── Collector endpoints (admin) ──
+
+    if (req.method === 'GET' && path === '/api/collect/status') {
+      const authHeader = req.headers.authorization || '';
+      const bearerKey = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+      if (!API_KEY || bearerKey !== API_KEY) return json(res, { error: 'invalid api key' }, 401);
+      return json(res, getCollectorStatus(db));
+    }
+
+    if (req.method === 'POST' && path === '/api/collect/trigger') {
+      const authHeader = req.headers.authorization || '';
+      const bearerKey = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+      if (!API_KEY || bearerKey !== API_KEY) return json(res, { error: 'invalid api key' }, 401);
+      const child = fork(join(__dirname, 'collector.mjs'), [], { stdio: 'pipe' });
+      let output = '';
+      child.stdout.on('data', (d) => { output += d; });
+      child.stderr.on('data', (d) => { output += d; });
+      child.on('close', () => {});
+      // Return immediately — collection runs in background
+      return json(res, { ok: true, message: 'collection started', pid: child.pid });
+    }
+
     // ── Config endpoints ──
 
     // GET /api/changelog?lang=zh|en
@@ -854,6 +1265,478 @@ const server = createServer(async (req, res) => {
       const body = await parseBody(req);
       for (const [k, v] of Object.entries(body)) setConfig(db, k, v);
       return json(res, { ok: true });
+    }
+
+    // ── Chat endpoint ──
+    if (req.method === 'POST' && path === '/api/chat') {
+      if (!LLM_API_KEY) return json(res, { error: 'chat not configured' }, 503);
+      if (!req.user) return json(res, { error: 'login required' }, 401);
+
+      // Rate limit: max 20 requests per minute per user
+      const now = Date.now();
+      const userId = req.user.id;
+      if (!chatRateLimit.has(userId)) chatRateLimit.set(userId, []);
+      const timestamps = chatRateLimit.get(userId).filter(t => now - t < 60000);
+      if (timestamps.length >= 20) return json(res, { error: 'rate limit exceeded, try again later' }, 429);
+      timestamps.push(now);
+      chatRateLimit.set(userId, timestamps);
+
+      const body = await parseBody(req);
+      const { message, history, digest_id } = body;
+      if (!message || typeof message !== 'string') return json(res, { error: 'message required' }, 400);
+
+      // Get digest content for context
+      let digestContent = '';
+      if (digest_id && /^\d+$/.test(String(digest_id))) {
+        const d = getDigest(db, parseInt(digest_id));
+        if (d) digestContent = d.content;
+      }
+      if (!digestContent) {
+        // Fall back to latest digest
+        const userId = req.user?.id;
+        const digests = userId
+          ? listDigestsByUser(db, userId, { type: '4h', limit: 1 })
+          : listDigests(db, { type: '4h', limit: 1, offset: 0 });
+        if (digests.length) digestContent = digests[0].content;
+      }
+
+      const systemPrompt = `You are ClawFeed AI Assistant, a helpful news analysis companion. You help users understand, explore, and discuss the content from their news digest.
+
+${digestContent ? `Here is the current digest content for context:\n\n${digestContent.slice(0, 6000)}` : 'No digest content is currently available.'}
+
+Guidelines:
+- Answer questions about the digest content accurately
+- Provide deeper analysis when asked (background, implications, related topics)
+- If asked about topics not in the digest, say so but offer what you can
+- Be concise but informative
+- Respond in the same language the user writes in`;
+
+      // Build messages array with history
+      const messages = [{ role: 'system', content: systemPrompt }];
+      if (Array.isArray(history)) {
+        for (const h of history.slice(-10)) {
+          if (h.role === 'user' || h.role === 'assistant') {
+            messages.push({ role: h.role, content: String(h.content).slice(0, 2000) });
+          }
+        }
+      }
+      messages.push({ role: 'user', content: message.slice(0, 2000) });
+
+      // Call LLM
+      try {
+        const reply = await new Promise((resolve, reject) => {
+          const url = new URL(LLM_API_URL);
+          const payload = JSON.stringify({
+            model: LLM_MODEL,
+            messages,
+            max_tokens: 1024,
+            temperature: 0.5,
+          });
+          const mod = url.protocol === 'https:' ? https : http;
+          const llmReq = mod.request(url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${LLM_API_KEY}`,
+              'Content-Length': Buffer.byteLength(payload),
+            },
+          }, (resp) => {
+            let data = '';
+            const MAX_RESP = 64 * 1024; // 64KB max LLM response
+            resp.on('data', c => { data += c; if (data.length > MAX_RESP) { resp.destroy(); reject(new Error('response too large')); } });
+            resp.on('end', () => {
+              clearTimeout(timer);
+              try {
+                const j = JSON.parse(data);
+                if (resp.statusCode !== 200) return reject(new Error(j.error?.message || 'LLM error'));
+                resolve(j.choices?.[0]?.message?.content?.slice(0, 8000) || '');
+              } catch (e) { reject(e); }
+            });
+          });
+          const timer = setTimeout(() => { llmReq.destroy(); reject(new Error('timeout')); }, LLM_TIMEOUT);
+          llmReq.on('error', e => { clearTimeout(timer); reject(e); });
+          llmReq.on('close', () => clearTimeout(timer));
+          llmReq.write(payload);
+          llmReq.end();
+        });
+        return json(res, { reply });
+      } catch (e) {
+        console.error('Chat LLM error:', e.message);
+        return json(res, { error: 'Failed to get response' }, 502);
+      }
+    }
+
+    // ── Email preferences endpoints ──
+
+    // GET /api/email/preferences — get current user's email pref
+    if (req.method === 'GET' && path === '/api/email/preferences') {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      const pref = getEmailPreference(db, req.user.id);
+      return json(res, pref ? { frequency: pref.frequency, last_sent_at: pref.last_sent_at } : { frequency: 'off', last_sent_at: null });
+    }
+
+    // PUT /api/email/preferences — update email frequency
+    if (req.method === 'PUT' && path === '/api/email/preferences') {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      const body = await parseBody(req);
+      const freq = body.frequency;
+      if (!['off', 'daily', 'weekly'].includes(freq)) {
+        return json(res, { error: 'frequency must be off, daily, or weekly' }, 400);
+      }
+      upsertEmailPreference(db, req.user.id, freq);
+      return json(res, { ok: true, frequency: freq });
+    }
+
+    // GET /api/email/unsubscribe?token=... — show confirmation page (safe from prefetchers)
+    if (req.method === 'GET' && path === '/api/email/unsubscribe') {
+      const token = params.get('token');
+      if (!token) return json(res, { error: 'token required' }, 400);
+      const pref = getEmailPrefByToken(db, token);
+      if (!pref) return json(res, { error: 'invalid token' }, 404);
+      // GET only shows confirmation — does NOT modify state (email client prefetchers issue)
+      const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Unsubscribe</title><style>body{font-family:sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#f4f4f7;}div{text-align:center;padding:40px;background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.08);max-width:400px;}button{padding:12px 32px;background:#e53e3e;color:#fff;border:none;border-radius:6px;font-size:16px;cursor:pointer;margin-top:16px;}button:hover{background:#c53030;}</style></head><body><div><h2>Unsubscribe from ClawFeed</h2><p>Click the button below to stop receiving email digests.</p><form method="POST" action="/api/email/unsubscribe?token=${encodeURIComponent(token)}"><button type="submit">Unsubscribe</button></form></div></body></html>`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+      return;
+    }
+
+    // POST /api/email/unsubscribe?token=... — execute unsubscribe
+    if (req.method === 'POST' && path === '/api/email/unsubscribe') {
+      const token = params.get('token');
+      if (!token) return json(res, { error: 'token required' }, 400);
+      const pref = getEmailPrefByToken(db, token);
+      if (!pref) return json(res, { error: 'invalid token' }, 404);
+      upsertEmailPreference(db, pref.user_id, 'off');
+      // Return success page for browser form submission
+      const acceptsHtml = (req.headers.accept || '').includes('text/html');
+      if (acceptsHtml) {
+        const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Unsubscribed</title><style>body{font-family:sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#f4f4f7;}div{text-align:center;padding:40px;background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.08);max-width:400px;}</style></head><body><div><h2>Unsubscribed</h2><p>You've been unsubscribed from ClawFeed email digests.</p><p>You can re-enable emails anytime from your ClawFeed settings.</p></div></body></html>`;
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+        return;
+      }
+      return json(res, { ok: true, message: 'unsubscribed' });
+    }
+
+    // ── Telegram settings endpoints ──
+
+    if (req.method === 'GET' && path === '/api/settings/telegram') {
+      if (!req.user) return json(res, { error: 'login required' }, 401);
+      const link = getTelegramLink(db, req.user.id);
+      if (!link) return json(res, { linked: false });
+      return json(res, {
+        linked: true,
+        enabled: !!link.enabled,
+        digest_types: JSON.parse(link.digest_types || '[]'),
+        linked_at: link.linked_at,
+      });
+    }
+
+    // POST /api/settings/telegram/link — verify code from Telegram bot
+    if (req.method === 'POST' && path === '/api/settings/telegram/link') {
+      if (!req.user) return json(res, { error: 'login required' }, 401);
+      const body = await parseBody(req);
+      const code = (body.code || '').trim();
+      if (!code || code.length !== 6) return json(res, { error: 'invalid code' }, 400);
+      const linkData = consumeLinkCode(db, code);
+      if (!linkData) return json(res, { error: 'invalid or expired code' }, 400);
+      saveTelegramLink(db, req.user.id, linkData.chat_id, linkData.chat_username);
+      return json(res, { ok: true });
+    }
+
+    // DELETE /api/settings/telegram — unlink
+    if (req.method === 'DELETE' && path === '/api/settings/telegram') {
+      if (!req.user) return json(res, { error: 'login required' }, 401);
+      removeTelegramLink(db, req.user.id);
+      return json(res, { ok: true });
+    }
+
+    // PUT /api/settings/telegram — update preferences
+    if (req.method === 'PUT' && path === '/api/settings/telegram') {
+      if (!req.user) return json(res, { error: 'login required' }, 401);
+      const body = await parseBody(req);
+      const validTypes = ['4h', 'daily', 'weekly', 'monthly'];
+      const digestTypes = Array.isArray(body.digest_types)
+        ? body.digest_types.filter(t => validTypes.includes(t))
+        : undefined;
+      updateTelegramPrefs(db, req.user.id, {
+        enabled: body.enabled,
+        digestTypes,
+      });
+      return json(res, { ok: true });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ── API v2 — Agent Friendly API (#42) ──
+    // All v2 responses follow the envelope: { data, meta } or { error, code }
+    // ─────────────────────────────────────────────────────────────────────
+
+    function v2ok(res, data, meta = {}, status = 200) {
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ data, meta }));
+    }
+    function v2err(res, message, code, status) {
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: message, code }));
+    }
+    function v2requireAuth(req, res) {
+      if (!req.user) { v2err(res, 'Authentication required. Use API key or session cookie.', 'UNAUTHORIZED', 401); return false; }
+      return true;
+    }
+
+    // GET /api/v2/openapi.json — OpenAPI 3.1 spec
+    if (req.method === 'GET' && path === '/api/v2/openapi.json') {
+      const spec = {
+        openapi: '3.1.0',
+        info: { title: 'ClawFeed API', version: '2.0.0', description: 'Agent-friendly API for ClawFeed — AI news digest platform.' },
+        servers: [{ url: '/api/v2', description: 'ClawFeed API v2' }],
+        security: [{ BearerAuth: [] }, { SessionCookie: [] }],
+        components: {
+          securitySchemes: {
+            BearerAuth: { type: 'http', scheme: 'bearer', description: 'API key with cf_ prefix' },
+            SessionCookie: { type: 'apiKey', in: 'cookie', name: COOKIE_NAME },
+          },
+          schemas: {
+            Digest: { type: 'object', properties: { id: { type: 'integer' }, type: { type: 'string', enum: ['4h', 'daily', 'weekly', 'monthly'] }, content: { type: 'string' }, metadata: { type: 'string' }, created_at: { type: 'string', format: 'date-time' } } },
+            Source: { type: 'object', properties: { id: { type: 'integer' }, name: { type: 'string' }, type: { type: 'string' }, is_active: { type: 'integer' }, is_public: { type: 'integer' }, created_at: { type: 'string', format: 'date-time' } } },
+            Webhook: { type: 'object', properties: { id: { type: 'integer' }, url: { type: 'string', format: 'uri' }, events: { type: 'string' }, is_active: { type: 'integer' }, created_at: { type: 'string', format: 'date-time' } } },
+            Error: { type: 'object', required: ['error', 'code'], properties: { error: { type: 'string' }, code: { type: 'string' } } },
+          },
+        },
+        paths: {
+          '/digests': { get: { summary: 'List digests', operationId: 'listDigests', parameters: [{ name: 'type', in: 'query', schema: { type: 'string', enum: ['4h', 'daily', 'weekly', 'monthly'] } }, { name: 'limit', in: 'query', schema: { type: 'integer', default: 20, maximum: 50 } }, { name: 'offset', in: 'query', schema: { type: 'integer', default: 0 } }], responses: { 200: { description: 'OK', content: { 'application/json': { schema: { type: 'object', properties: { data: { type: 'array', items: { $ref: '#/components/schemas/Digest' } }, meta: { type: 'object' } } } } } } } } },
+          '/digests/{id}': { get: { summary: 'Get digest by ID', operationId: 'getDigest', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }], responses: { 200: { description: 'OK' }, 404: { description: 'Not found' } } } },
+          '/sources': { get: { summary: 'List sources', operationId: 'listSources', responses: { 200: { description: 'OK' } } } },
+          '/me/feed': { get: { summary: 'Get authenticated user feed', operationId: 'getUserFeed', responses: { 200: { description: 'OK' }, 401: { description: 'Unauthorized' } } } },
+          '/webhooks': {
+            get: { summary: 'List webhooks', operationId: 'listWebhooks', responses: { 200: { description: 'OK' }, 401: { description: 'Unauthorized' } } },
+            post: { summary: 'Create webhook', operationId: 'createWebhook', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['url', 'events'], properties: { url: { type: 'string', format: 'uri' }, events: { type: 'array', items: { type: 'string' } }, secret: { type: 'string' } } } } } }, responses: { 201: { description: 'Created' }, 401: { description: 'Unauthorized' } } },
+          },
+          '/webhooks/{id}': {
+            patch: { summary: 'Update webhook', operationId: 'updateWebhook', responses: { 200: { description: 'OK' }, 401: { description: 'Unauthorized' }, 404: { description: 'Not found' } } },
+            delete: { summary: 'Delete webhook', operationId: 'deleteWebhook', responses: { 204: { description: 'Deleted' }, 401: { description: 'Unauthorized' }, 404: { description: 'Not found' } } },
+          },
+          '/api-keys': {
+            get: { summary: 'List API keys', operationId: 'listApiKeys', responses: { 200: { description: 'OK' }, 401: { description: 'Unauthorized' } } },
+            post: { summary: 'Create API key', operationId: 'createApiKey', responses: { 201: { description: 'Created' }, 401: { description: 'Unauthorized' } } },
+          },
+          '/api-keys/{id}': { delete: { summary: 'Revoke API key', operationId: 'revokeApiKey', responses: { 204: { description: 'Revoked' }, 401: { description: 'Unauthorized' }, 404: { description: 'Not found' } } } },
+          '/mcp': { post: { summary: 'MCP JSON-RPC endpoint', operationId: 'mcp', requestBody: { required: true, content: { 'application/json': { schema: { type: 'object' } } } }, responses: { 200: { description: 'JSON-RPC response' } } } },
+        },
+      };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(spec, null, 2));
+      return;
+    }
+
+    // GET /api/v2/digests
+    if (req.method === 'GET' && path === '/api/v2/digests') {
+      const type = params.get('type') || undefined;
+      const limit = Math.min(parseInt(params.get('limit') || '20', 10), 50);
+      const offset = parseInt(params.get('offset') || '0', 10);
+      const digests = req.user
+        ? listDigestsByUser(db, req.user.id, { type, limit })
+        : listDigests(db, { type, limit, offset });
+      return v2ok(res, digests, { limit, offset, count: digests.length });
+    }
+
+    // GET /api/v2/digests/:id
+    const v2DigestMatch = path.match(/^\/api\/v2\/digests\/(\d+)$/);
+    if (req.method === 'GET' && v2DigestMatch) {
+      const d = getDigest(db, parseInt(v2DigestMatch[1]));
+      if (!d) return v2err(res, 'Digest not found', 'NOT_FOUND', 404);
+      return v2ok(res, d);
+    }
+
+    // GET /api/v2/sources
+    if (req.method === 'GET' && path === '/api/v2/sources') {
+      const sources = req.user
+        ? listSources(db, { activeOnly: params.get('active') !== '0', userId: req.user.id, includePublic: true })
+        : listSources(db, { activeOnly: true, includePublic: true });
+      return v2ok(res, sources.map(s => ({
+        id: s.id, name: s.name, type: s.type, is_active: s.is_active,
+        is_public: s.is_public, created_at: s.created_at,
+      })), { count: sources.length });
+    }
+
+    // GET /api/v2/me/feed — authenticated user's personalized feed
+    if (req.method === 'GET' && path === '/api/v2/me/feed') {
+      if (!v2requireAuth(req, res)) return;
+      const type = params.get('type') || '4h';
+      const limit = Math.min(parseInt(params.get('limit') || '10', 10), 50);
+      const since = params.get('since') || undefined;
+      const digests = listDigestsByUser(db, req.user.id, { type, limit, since });
+      const total = countDigestsByUser(db, req.user.id, { type });
+      const sourceIds = getActiveSubscriptionSourceIds(db, req.user.id);
+      return v2ok(res, digests, {
+        user: { id: req.user.id, name: req.user.name, slug: req.user.slug },
+        total,
+        subscriptions: sourceIds.length,
+        type,
+      });
+    }
+
+    // ── Webhooks CRUD ──
+
+    // GET /api/v2/webhooks
+    if (req.method === 'GET' && path === '/api/v2/webhooks') {
+      if (!v2requireAuth(req, res)) return;
+      const hooks = listWebhooks(db, req.user.id);
+      return v2ok(res, hooks.map(h => ({ ...h, events: JSON.parse(h.events || '[]') })));
+    }
+
+    // POST /api/v2/webhooks
+    if (req.method === 'POST' && path === '/api/v2/webhooks') {
+      if (!v2requireAuth(req, res)) return;
+      const body = await parseBody(req);
+      const { url: hookUrl, events, secret } = body;
+      if (!hookUrl || typeof hookUrl !== 'string') return v2err(res, 'url is required', 'VALIDATION_ERROR', 400);
+      try { new URL(hookUrl); } catch { return v2err(res, 'url must be a valid URL', 'VALIDATION_ERROR', 400); }
+      const validEvents = ['digest.created', 'source.updated', 'source.created', '*'];
+      const hookEvents = Array.isArray(events) ? events.filter(e => validEvents.includes(e)) : ['digest.created'];
+      if (!hookEvents.length) return v2err(res, `events must include at least one of: ${validEvents.join(', ')}`, 'VALIDATION_ERROR', 400);
+      const hookSecret = (typeof secret === 'string' && secret.length >= 16) ? secret : randomBytes(32).toString('hex');
+      const result = createWebhook(db, { userId: req.user.id, url: hookUrl, secret: hookSecret, events: hookEvents });
+      return v2ok(res, { id: result.id, url: hookUrl, events: hookEvents, secret: hookSecret, is_active: 1 }, {}, 201);
+    }
+
+    // PATCH /api/v2/webhooks/:id
+    const v2WebhookMatch = path.match(/^\/api\/v2\/webhooks\/(\d+)$/);
+    if (req.method === 'PATCH' && v2WebhookMatch) {
+      if (!v2requireAuth(req, res)) return;
+      const hook = getWebhook(db, parseInt(v2WebhookMatch[1]), req.user.id);
+      if (!hook) return v2err(res, 'Webhook not found', 'NOT_FOUND', 404);
+      const body = await parseBody(req);
+      updateWebhook(db, hook.id, req.user.id, body);
+      return v2ok(res, { id: hook.id, updated: true });
+    }
+
+    // DELETE /api/v2/webhooks/:id
+    if (req.method === 'DELETE' && v2WebhookMatch) {
+      if (!v2requireAuth(req, res)) return;
+      const r = deleteWebhook(db, parseInt(v2WebhookMatch[1]), req.user.id);
+      if (!r.changes) return v2err(res, 'Webhook not found', 'NOT_FOUND', 404);
+      res.writeHead(204); res.end(); return;
+    }
+
+    // POST /api/v2/webhooks/:id/test — send test event
+    const v2WebhookTestMatch = path.match(/^\/api\/v2\/webhooks\/(\d+)\/test$/);
+    if (req.method === 'POST' && v2WebhookTestMatch) {
+      if (!v2requireAuth(req, res)) return;
+      const hook = getWebhook(db, parseInt(v2WebhookTestMatch[1]), req.user.id);
+      if (!hook) return v2err(res, 'Webhook not found', 'NOT_FOUND', 404);
+      // Fire test delivery (fire-and-forget)
+      deliverWebhook('webhook.test', { webhook_id: hook.id, message: 'This is a test delivery from ClawFeed.' }).catch(() => {});
+      return v2ok(res, { ok: true, message: 'Test delivery queued' });
+    }
+
+    // ── API Keys ──
+
+    // GET /api/v2/api-keys
+    if (req.method === 'GET' && path === '/api/v2/api-keys') {
+      if (!v2requireAuth(req, res)) return;
+      const keys = listApiKeys(db, req.user.id);
+      return v2ok(res, keys.map(k => ({ ...k, scopes: JSON.parse(k.scopes || '["read"]') })));
+    }
+
+    // POST /api/v2/api-keys
+    if (req.method === 'POST' && path === '/api/v2/api-keys') {
+      if (!v2requireAuth(req, res)) return;
+      const body = await parseBody(req);
+      const validScopes = ['read', 'write', 'webhooks'];
+      const scopes = Array.isArray(body.scopes) ? body.scopes.filter(s => validScopes.includes(s)) : ['read'];
+      // Generate a new key
+      const rawKey = 'cf_' + randomBytes(32).toString('hex');
+      const keyHash = createHash('sha256').update(rawKey).digest('hex');
+      const keyPrefix = rawKey.slice(0, 10);
+      const result = createApiKey(db, { userId: req.user.id, keyHash, keyPrefix, name: body.name || null, scopes });
+      return v2ok(res, { id: result.id, key: rawKey, key_prefix: keyPrefix, name: body.name || null, scopes }, {}, 201);
+    }
+
+    // DELETE /api/v2/api-keys/:id
+    const v2ApiKeyMatch = path.match(/^\/api\/v2\/api-keys\/(\d+)$/);
+    if (req.method === 'DELETE' && v2ApiKeyMatch) {
+      if (!v2requireAuth(req, res)) return;
+      const r = revokeApiKey(db, parseInt(v2ApiKeyMatch[1]), req.user.id);
+      if (!r.changes) return v2err(res, 'API key not found', 'NOT_FOUND', 404);
+      res.writeHead(204); res.end(); return;
+    }
+
+    // ── MCP Server (#42) — JSON-RPC 2.0 over HTTP ──
+    if (req.method === 'POST' && path === '/api/v2/mcp') {
+      const body = await parseBody(req);
+      const { jsonrpc, id, method, params: rpcParams } = body;
+      if (jsonrpc !== '2.0') return json(res, { jsonrpc: '2.0', id: id || null, error: { code: -32600, message: 'Invalid Request' } }, 400);
+
+      function rpcOk(result) { return json(res, { jsonrpc: '2.0', id: id || null, result }); }
+      function rpcErr(code, message) { return json(res, { jsonrpc: '2.0', id: id || null, error: { code, message } }); }
+
+      if (method === 'initialize') {
+        return rpcOk({
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'clawfeed', version: '2.0.0' },
+        });
+      }
+
+      if (method === 'tools/list') {
+        return rpcOk({ tools: [
+          { name: 'list_digests', description: 'List recent ClawFeed digests', inputSchema: { type: 'object', properties: { type: { type: 'string', enum: ['4h', 'daily', 'weekly', 'monthly'], description: 'Digest type' }, limit: { type: 'integer', default: 5, maximum: 20 } }, required: [] } },
+          { name: 'get_digest', description: 'Get a specific digest by ID', inputSchema: { type: 'object', properties: { id: { type: 'integer', description: 'Digest ID' } }, required: ['id'] } },
+          { name: 'list_sources', description: 'List active content sources', inputSchema: { type: 'object', properties: { active_only: { type: 'boolean', default: true } }, required: [] } },
+          { name: 'get_user_feed', description: 'Get personalized digest feed for authenticated user', inputSchema: { type: 'object', properties: { type: { type: 'string', enum: ['4h', 'daily', 'weekly', 'monthly'] }, limit: { type: 'integer', default: 5, maximum: 20 } }, required: [] } },
+          { name: 'list_items', description: 'List raw feed items from subscribed sources', inputSchema: { type: 'object', properties: { source_id: { type: 'integer' }, limit: { type: 'integer', default: 20, maximum: 100 }, since: { type: 'string', format: 'date-time' } }, required: [] } },
+        ]});
+      }
+
+      if (method === 'tools/call') {
+        const toolName = rpcParams?.name;
+        const toolArgs = rpcParams?.arguments || {};
+        attachUser(req);
+
+        if (toolName === 'list_digests') {
+          const limit = Math.min(toolArgs.limit || 5, 20);
+          const digests = req.user
+            ? listDigestsByUser(db, req.user.id, { type: toolArgs.type, limit })
+            : listDigests(db, { type: toolArgs.type, limit, offset: 0 });
+          return rpcOk({ content: [{ type: 'text', text: JSON.stringify(digests.map(d => ({ id: d.id, type: d.type, created_at: d.created_at, preview: d.content.slice(0, 500) })), null, 2) }] });
+        }
+
+        if (toolName === 'get_digest') {
+          if (!toolArgs.id) return rpcErr(-32602, 'id is required');
+          const d = getDigest(db, parseInt(toolArgs.id));
+          if (!d) return rpcErr(-32602, 'Digest not found');
+          return rpcOk({ content: [{ type: 'text', text: d.content }] });
+        }
+
+        if (toolName === 'list_sources') {
+          const sources = listSources(db, { activeOnly: toolArgs.active_only !== false, includePublic: true });
+          return rpcOk({ content: [{ type: 'text', text: JSON.stringify(sources.map(s => ({ id: s.id, name: s.name, type: s.type })), null, 2) }] });
+        }
+
+        if (toolName === 'get_user_feed') {
+          if (!req.user) return rpcErr(-32001, 'Authentication required');
+          const limit = Math.min(toolArgs.limit || 5, 20);
+          const digests = listDigestsByUser(db, req.user.id, { type: toolArgs.type, limit });
+          return rpcOk({ content: [{ type: 'text', text: JSON.stringify(digests.map(d => ({ id: d.id, type: d.type, created_at: d.created_at, content: d.content })), null, 2) }] });
+        }
+
+        if (toolName === 'list_items') {
+          if (!req.user) return rpcErr(-32001, 'Authentication required');
+          const subs = listSubscriptions(db, req.user.id);
+          const userSourceIds = new Set(subs.filter(s => !s.is_deleted).map(s => s.id));
+          const sid = toolArgs.source_id ? parseInt(toolArgs.source_id) : undefined;
+          if (sid && !userSourceIds.has(sid)) return rpcErr(-32602, 'Source not found or not subscribed');
+          const limit = Math.min(toolArgs.limit || 20, 100);
+          const items = listRawItems(db, { sourceId: sid, since: toolArgs.since, limit, offset: 0 });
+          const filtered = sid ? items : items.filter(i => userSourceIds.has(i.source_id));
+          return rpcOk({ content: [{ type: 'text', text: JSON.stringify(filtered.map(i => ({ id: i.id, title: i.title, url: i.url, source_name: i.source_name, published_at: i.published_at })), null, 2) }] });
+        }
+
+        return rpcErr(-32601, `Unknown tool: ${toolName}`);
+      }
+
+      return rpcErr(-32601, `Method not found: ${method}`);
     }
 
     json(res, { error: 'not found' }, 404);

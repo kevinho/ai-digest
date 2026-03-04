@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { createHash, randomBytes } from 'crypto';
 import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -102,6 +103,83 @@ export function getDb(dbPath) {
   } catch (e) {
     if (!e.message.includes('duplicate column')) console.error('Migration 009:', e.message);
   }
+  // Migration 010: raw_items table + sources error tracking
+  try {
+    const sql10 = readFileSync(join(ROOT, 'migrations', '010_raw_items.sql'), 'utf8');
+    for (const stmt of sql10.split(';').map(s => s.trim()).filter(Boolean)) {
+      try { _db.exec(stmt + ';'); } catch (e) {
+        if (!e.message.includes('duplicate column') && !e.message.includes('already exists')) throw e;
+      }
+    }
+  } catch (e) {
+    if (!e.message.includes('duplicate column') && !e.message.includes('already exists')) console.error('Migration 010:', e.message);
+  }
+  // Migration 011: digest generation optimization
+  try {
+    const sql11 = readFileSync(join(ROOT, 'migrations', '011_digest_generation.sql'), 'utf8');
+    for (const stmt of sql11.split(';').map(s => s.trim()).filter(Boolean)) {
+      try { _db.exec(stmt + ';'); } catch (e) {
+        if (!e.message.includes('already exists')) throw e;
+      }
+    }
+  } catch (e) {
+    if (!e.message.includes('already exists')) console.error('Migration 011:', e.message);
+  }
+  // Migration 012: email preferences
+  try {
+    const sql12 = readFileSync(join(ROOT, 'migrations', '012_email_preferences.sql'), 'utf8');
+    for (const stmt of sql12.split(';').map(s => s.trim()).filter(Boolean)) {
+      try { _db.exec(stmt + ';'); } catch (e) {
+        if (!e.message.includes('already exists') && !e.message.includes('duplicate column')) throw e;
+      }
+    }
+  } catch (e) {
+    if (!e.message.includes('already exists') && !e.message.includes('duplicate column')) console.error('Migration 012:', e.message);
+  }
+  // Migration 013: Telegram push notifications
+  try {
+    const sql13 = readFileSync(join(ROOT, 'migrations', '013_telegram.sql'), 'utf8');
+    for (const stmt of sql13.split(';').map(s => s.trim()).filter(Boolean)) {
+      try { _db.exec(stmt + ';'); } catch (e) {
+        if (!e.message.includes('already exists')) throw e;
+      }
+    }
+  } catch (e) {
+    if (!e.message.includes('already exists')) console.error('Migration 013:', e.message);
+  }
+  // Migration 014: Mark enhancement (#12)
+  try {
+    const sql14 = readFileSync(join(ROOT, 'migrations', '014_mark_enhancement.sql'), 'utf8');
+    for (const stmt of sql14.split(';').map(s => s.trim()).filter(Boolean)) {
+      try { _db.exec(stmt + ';'); } catch (e) {
+        if (!e.message.includes('already exists') && !e.message.includes('duplicate column')) throw e;
+      }
+    }
+  } catch (e) {
+    if (!e.message.includes('already exists') && !e.message.includes('duplicate column')) console.error('Migration 014:', e.message);
+  }
+  // Migration 015: digest quality (source weights, item feedback, topics)
+  try {
+    const sql15 = readFileSync(join(ROOT, 'migrations', '015_digest_quality.sql'), 'utf8');
+    for (const stmt of sql15.split(';').map(s => s.trim()).filter(Boolean)) {
+      try { _db.exec(stmt + ';'); } catch (e) {
+        if (!e.message.includes('duplicate column') && !e.message.includes('already exists')) throw e;
+      }
+    }
+  } catch (e) {
+    if (!e.message.includes('duplicate column') && !e.message.includes('already exists')) console.error('Migration 015:', e.message);
+  }
+  // Migration 016: agent API (digest cache + webhooks + api keys)
+  try {
+    const sql16 = readFileSync(join(ROOT, 'migrations', '016_agent_api.sql'), 'utf8');
+    for (const stmt of sql16.split(';').map(s => s.trim()).filter(Boolean)) {
+      try { _db.exec(stmt + ';'); } catch (e) {
+        if (!e.message.includes('already exists')) throw e;
+      }
+    }
+  } catch (e) {
+    if (!e.message.includes('already exists')) console.error('Migration 016:', e.message);
+  }
   // Backfill slugs for existing users
   _backfillSlugs(_db);
   return _db;
@@ -142,11 +220,12 @@ export function getDigest(db, id) {
   return db.prepare('SELECT * FROM digests WHERE id = ?').get(id);
 }
 
-export function createDigest(db, { type, content, metadata = '{}', created_at }) {
+export function createDigest(db, { type, content, metadata = '{}', created_at, user_id }) {
+  const uid = user_id || null;
   const sql = created_at
-    ? 'INSERT INTO digests (type, content, metadata, created_at) VALUES (?, ?, ?, ?)'
-    : 'INSERT INTO digests (type, content, metadata) VALUES (?, ?, ?)';
-  const params = created_at ? [type, content, metadata, created_at] : [type, content, metadata];
+    ? 'INSERT INTO digests (type, content, metadata, created_at, user_id) VALUES (?, ?, ?, ?, ?)'
+    : 'INSERT INTO digests (type, content, metadata, user_id) VALUES (?, ?, ?, ?)';
+  const params = created_at ? [type, content, metadata, created_at, uid] : [type, content, metadata, uid];
   const result = db.prepare(sql).run(...params);
   return { id: result.lastInsertRowid };
 }
@@ -183,6 +262,52 @@ export function migrateMarksToUser(db, userId) {
 
 export function updateMarkStatus(db, id, status) {
   return db.prepare('UPDATE marks SET status = ? WHERE id = ?').run(status, id);
+}
+
+export function getMark(db, id, userId) {
+  return db.prepare('SELECT * FROM marks WHERE id = ? AND user_id = ?').get(id, userId);
+}
+
+export function updateMarkAnalysis(db, id, analysis, tags = '[]') {
+  return db.prepare(
+    'UPDATE marks SET analysis = ?, tags = ?, analyzed_at = datetime(\'now\'), status = \'processed\' WHERE id = ?'
+  ).run(analysis, tags, id);
+}
+
+export function setMarkShareToken(db, id, token) {
+  return db.prepare('UPDATE marks SET share_token = ? WHERE id = ?').run(token, id);
+}
+
+export function getMarkByShareToken(db, token) {
+  return db.prepare(
+    `SELECT m.*, u.name as user_name FROM marks m
+     LEFT JOIN users u ON m.user_id = u.id
+     WHERE m.share_token = ?`
+  ).get(token);
+}
+
+export function revokeMarkShare(db, id, userId) {
+  return db.prepare('UPDATE marks SET share_token = NULL WHERE id = ? AND user_id = ?').run(id, userId);
+}
+
+export function listMarksForExport(db, userId, { status, since, until, limit = 1000 } = {}) {
+  let sql = 'SELECT * FROM marks WHERE user_id = ?';
+  const params = [userId];
+  if (status) { sql += ' AND status = ?'; params.push(status); }
+  if (since) { sql += ' AND created_at >= ?'; params.push(since); }
+  if (until) { sql += ' AND created_at <= ?'; params.push(until); }
+  sql += ' ORDER BY created_at DESC LIMIT ?';
+  params.push(limit);
+  return db.prepare(sql).all(...params);
+}
+
+export function getUserMarkTopics(db, userId, limit = 20) {
+  // Get recent marks with tags for preference analysis
+  return db.prepare(
+    `SELECT tags, title, note, url FROM marks
+     WHERE user_id = ? AND tags != '[]' AND tags IS NOT NULL
+     ORDER BY created_at DESC LIMIT ?`
+  ).all(userId, limit);
 }
 
 // ── Auth ──
@@ -440,6 +565,154 @@ export function getUnreadFeedbackCount(db, userId) {
   return db.prepare("SELECT COUNT(*) as count FROM feedback WHERE user_id = ? AND reply IS NOT NULL AND read_at IS NULL").get(userId)?.count || 0;
 }
 
+// ── Raw Items ──
+
+export function insertRawItemsBatch(db, sourceId, items) {
+  const stmt = db.prepare(
+    'INSERT OR IGNORE INTO raw_items (source_id, title, url, author, content, published_at, dedup_key, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  );
+  const run = db.transaction((rows) => {
+    let inserted = 0;
+    for (const item of rows) {
+      const key = item.dedupKey || (item.url ? `${sourceId}:${item.url}` : `${sourceId}:${_contentHash(item.content)}`);
+      const meta = typeof item.metadata === 'string' ? item.metadata : JSON.stringify(item.metadata || {});
+      const r = stmt.run(sourceId, item.title || '', item.url || '', item.author || '', item.content || '', item.publishedAt || null, key, meta);
+      inserted += r.changes;
+    }
+    return inserted;
+  });
+  return run(items);
+}
+
+function _contentHash(content) {
+  return 'sha256:' + createHash('sha256').update(content || '').digest('hex').slice(0, 16);
+}
+
+export function listRawItems(db, { sourceId, since, limit = 100, offset = 0 } = {}) {
+  let sql = 'SELECT ri.*, s.name as source_name, s.type as source_type FROM raw_items ri JOIN sources s ON ri.source_id = s.id';
+  const conditions = [];
+  const params = [];
+  if (sourceId) { conditions.push('ri.source_id = ?'); params.push(sourceId); }
+  if (since) { conditions.push('ri.fetched_at >= ?'); params.push(since); }
+  if (conditions.length) sql += ' WHERE ' + conditions.join(' AND ');
+  sql += ' ORDER BY ri.fetched_at DESC LIMIT ? OFFSET ?';
+  params.push(Math.min(limit, 500), offset);
+  return db.prepare(sql).all(...params);
+}
+
+export function listRawItemsForDigest(db, sourceIds, { since, limit = 500 } = {}) {
+  if (!sourceIds.length) return [];
+  const placeholders = sourceIds.map(() => '?').join(',');
+  let sql = `SELECT ri.*, s.name as source_name, s.type as source_type FROM raw_items ri JOIN sources s ON ri.source_id = s.id WHERE ri.source_id IN (${placeholders})`;
+  const params = [...sourceIds];
+  if (since) { sql += ' AND ri.fetched_at >= ?'; params.push(since); }
+  sql += ' ORDER BY ri.fetched_at DESC LIMIT ?';
+  params.push(Math.min(limit, 1000));
+  return db.prepare(sql).all(...params);
+}
+
+export function getRawItemStats(db) {
+  return db.prepare(`
+    SELECT s.id as source_id, s.name, s.type,
+      COUNT(ri.id) as total_items,
+      MAX(ri.fetched_at) as last_item_at,
+      COUNT(CASE WHEN ri.fetched_at >= datetime('now', '-24 hours') THEN 1 END) as items_24h
+    FROM sources s
+    LEFT JOIN raw_items ri ON s.id = ri.source_id
+    WHERE s.is_active = 1 AND s.is_deleted = 0
+    GROUP BY s.id
+    ORDER BY last_item_at DESC NULLS LAST
+  `).all();
+}
+
+export function cleanOldRawItems(db, daysToKeep = 30) {
+  return db.prepare("DELETE FROM raw_items WHERE fetched_at < datetime('now', '-' || ? || ' days')").run(daysToKeep);
+}
+
+export function touchSourceFetch(db, sourceId) {
+  return db.prepare("UPDATE sources SET last_fetched_at = datetime('now'), fetch_count = fetch_count + 1, fetch_error_count = 0 WHERE id = ?").run(sourceId);
+}
+
+export function recordSourceError(db, sourceId, errorMsg) {
+  const lastError = JSON.stringify({ message: errorMsg, at: new Date().toISOString() });
+  db.prepare("UPDATE sources SET fetch_error_count = fetch_error_count + 1, last_error = ? WHERE id = ?").run(lastError, sourceId);
+  // Auto-pause after 5 consecutive failures
+  db.prepare("UPDATE sources SET is_active = 0 WHERE id = ? AND fetch_error_count >= 5").run(sourceId);
+}
+
+export function getSourcesDueForFetch(db) {
+  // Only query types that have a fetcher implemented (skip twitter_* until Phase 1.5)
+  return db.prepare(`
+    SELECT * FROM sources
+    WHERE is_active = 1 AND is_deleted = 0
+    AND type IN ('rss', 'digest_feed', 'hackernews', 'reddit', 'github_trending', 'website')
+    AND (
+      last_fetched_at IS NULL
+      OR (type IN ('hackernews', 'reddit') AND last_fetched_at < datetime('now', '-1 hour'))
+      OR (type IN ('rss', 'website', 'digest_feed', 'github_trending') AND last_fetched_at < datetime('now', '-4 hours'))
+    )
+    ORDER BY last_fetched_at ASC NULLS FIRST
+  `).all();
+}
+
+export function getCollectorStatus(db) {
+  const due = db.prepare(`
+    SELECT COUNT(*) as count FROM sources
+    WHERE is_active = 1 AND is_deleted = 0
+    AND type IN ('rss', 'digest_feed', 'hackernews', 'reddit', 'github_trending', 'website')
+    AND (
+      last_fetched_at IS NULL
+      OR (type IN ('hackernews', 'reddit') AND last_fetched_at < datetime('now', '-1 hour'))
+      OR (type IN ('rss', 'website', 'digest_feed', 'github_trending') AND last_fetched_at < datetime('now', '-4 hours'))
+    )
+  `).get();
+  const total = db.prepare("SELECT COUNT(*) as count FROM sources WHERE is_active = 1 AND is_deleted = 0").get();
+  const paused = db.prepare("SELECT COUNT(*) as count FROM sources WHERE is_active = 0 AND is_deleted = 0 AND fetch_error_count >= 5").get();
+  const lastFetch = db.prepare("SELECT MAX(last_fetched_at) as last_at FROM sources WHERE last_fetched_at IS NOT NULL").get();
+  const rawItemCount = db.prepare("SELECT COUNT(*) as count FROM raw_items").get();
+  const rawItems24h = db.prepare("SELECT COUNT(*) as count FROM raw_items WHERE fetched_at >= datetime('now', '-24 hours')").get();
+  return {
+    sources_due: due.count,
+    sources_active: total.count,
+    sources_paused: paused.count,
+    last_fetch_at: lastFetch.last_at,
+    raw_items_total: rawItemCount.count,
+    raw_items_24h: rawItems24h.count,
+  };
+}
+
+// ── Digest Generation ──
+
+export function getLastDigestTime(db, userId, type) {
+  const row = db.prepare(
+    'SELECT created_at FROM digests WHERE user_id = ? AND type = ? ORDER BY created_at DESC LIMIT 1'
+  ).get(userId, type);
+  return row ? row.created_at : null;
+}
+
+export function getActiveSubscriptionSourceIds(db, userId) {
+  return db.prepare(
+    'SELECT s.id FROM user_subscriptions us JOIN sources s ON us.source_id = s.id WHERE us.user_id = ? AND s.is_active = 1 AND s.is_deleted = 0'
+  ).all(userId).map(r => r.id);
+}
+
+export function getUsersDueForDigest(db, type, intervalHours) {
+  // Find users with active subscriptions whose last digest of this type
+  // is older than the interval (or who have never had one)
+  return db.prepare(`
+    SELECT DISTINCT us.user_id as id, u.name, u.slug
+    FROM user_subscriptions us
+    JOIN users u ON us.user_id = u.id
+    JOIN sources s ON us.source_id = s.id
+    WHERE s.is_active = 1 AND s.is_deleted = 0
+    AND NOT EXISTS (
+      SELECT 1 FROM digests d
+      WHERE d.user_id = us.user_id AND d.type = ?
+      AND d.created_at >= datetime('now', '-' || ? || ' hours')
+    )
+  `).all(type, intervalHours);
+}
+
 // ── Config ──
 
 export function getConfig(db) {
@@ -454,4 +727,342 @@ export function getConfig(db) {
 export function setConfig(db, key, value) {
   const v = typeof value === 'string' ? value : JSON.stringify(value);
   db.prepare('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)').run(key, v);
+}
+
+// ── Email Preferences ──
+
+export function getEmailPreference(db, userId) {
+  return db.prepare('SELECT * FROM email_preferences WHERE user_id = ?').get(userId);
+}
+
+export function upsertEmailPreference(db, userId, frequency) {
+  const existing = getEmailPreference(db, userId);
+  if (existing) {
+    db.prepare("UPDATE email_preferences SET frequency = ?, updated_at = datetime('now') WHERE user_id = ?").run(frequency, userId);
+    return existing;
+  }
+  const token = randomBytes(32).toString('hex');
+  db.prepare('INSERT INTO email_preferences (user_id, frequency, unsubscribe_token) VALUES (?, ?, ?)').run(userId, frequency, token);
+  return getEmailPreference(db, userId);
+}
+
+export function getEmailPrefByToken(db, token) {
+  return db.prepare(`
+    SELECT ep.*, u.name, u.email, u.slug
+    FROM email_preferences ep
+    JOIN users u ON ep.user_id = u.id
+    WHERE ep.unsubscribe_token = ?
+  `).get(token);
+}
+
+export function getUsersDueForEmail(db, type) {
+  const intervalHours = type === 'weekly' ? 168 : 24;
+  return db.prepare(`
+    SELECT u.id, u.name, u.email, u.slug
+    FROM users u
+    JOIN email_preferences ep ON u.id = ep.user_id
+    WHERE ep.frequency = ?
+    AND u.email IS NOT NULL
+    AND (
+      ep.last_sent_at IS NULL
+      OR ep.last_sent_at < datetime('now', '-' || ? || ' hours')
+    )
+  `).all(type, intervalHours);
+}
+
+export function logEmail(db, userId, digestId) {
+  const result = db.prepare('INSERT INTO email_log (user_id, digest_id) VALUES (?, ?)').run(userId, digestId);
+  return result.lastInsertRowid;
+}
+
+export function updateEmailLog(db, logId, status, resendId, error) {
+  db.prepare('UPDATE email_log SET status = ?, resend_id = ?, error = ? WHERE id = ?').run(status, resendId || null, error || null, logId);
+}
+
+export function touchEmailSent(db, userId) {
+  db.prepare("UPDATE email_preferences SET last_sent_at = datetime('now') WHERE user_id = ?").run(userId);
+}
+
+// ── Telegram ──
+
+export function saveTelegramLink(db, userId, chatId, username) {
+  return db.prepare(
+    `INSERT INTO telegram_links (user_id, chat_id, chat_username, enabled, digest_types)
+     VALUES (?, ?, ?, 1, ?)
+     ON CONFLICT(user_id) DO UPDATE SET chat_id = excluded.chat_id, chat_username = excluded.chat_username`
+  ).run(userId, chatId, username || null, JSON.stringify(['4h', 'daily']));
+}
+
+export function getTelegramLink(db, userId) {
+  return db.prepare('SELECT * FROM telegram_links WHERE user_id = ?').get(userId);
+}
+
+export function getTelegramLinkByChatId(db, chatId) {
+  return db.prepare('SELECT * FROM telegram_links WHERE chat_id = ?').get(chatId);
+}
+
+export function removeTelegramLink(db, userId) {
+  return db.prepare('DELETE FROM telegram_links WHERE user_id = ?').run(userId);
+}
+
+export function updateTelegramPrefs(db, userId, { enabled, digestTypes }) {
+  const sets = [];
+  const params = [];
+  if (enabled !== undefined) { sets.push('enabled = ?'); params.push(enabled ? 1 : 0); }
+  if (digestTypes) { sets.push('digest_types = ?'); params.push(JSON.stringify(digestTypes)); }
+  if (!sets.length) return { changes: 0 };
+  params.push(userId);
+  return db.prepare(`UPDATE telegram_links SET ${sets.join(', ')} WHERE user_id = ?`).run(...params);
+}
+
+export function getUsersWithTelegramForDigest(db, digestType) {
+  // Filter by digest_types JSON array containing the given type
+  return db.prepare(`
+    SELECT tl.chat_id, tl.user_id, u.name, u.slug
+    FROM telegram_links tl
+    JOIN users u ON tl.user_id = u.id
+    WHERE tl.enabled = 1
+    AND EXISTS (
+      SELECT 1 FROM json_each(tl.digest_types) WHERE json_each.value = ?
+    )
+  `).all(digestType);
+}
+
+export function getEnabledTelegramUsers(db) {
+  return db.prepare(`
+    SELECT tl.*, u.name, u.slug
+    FROM telegram_links tl
+    JOIN users u ON tl.user_id = u.id
+    WHERE tl.enabled = 1
+  `).all();
+}
+
+export function createLinkCode(db, code, chatId, username) {
+  // Clean up old codes first (> 10 min)
+  db.prepare("DELETE FROM telegram_link_codes WHERE created_at < datetime('now', '-10 minutes')").run();
+  return db.prepare('INSERT OR REPLACE INTO telegram_link_codes (code, chat_id, chat_username) VALUES (?, ?, ?)').run(code, chatId, username || null);
+}
+
+export function consumeLinkCode(db, code) {
+  const row = db.prepare(
+    "SELECT * FROM telegram_link_codes WHERE code = ? AND created_at >= datetime('now', '-10 minutes')"
+  ).get(code);
+  if (row) {
+    db.prepare('DELETE FROM telegram_link_codes WHERE code = ?').run(code);
+    return row;
+  }
+  // Wrong code — increment attempts on all active codes to mitigate brute-force
+  // If any code exceeds 5 attempts, invalidate it
+  db.prepare("UPDATE telegram_link_codes SET attempts = attempts + 1 WHERE created_at >= datetime('now', '-10 minutes')").run();
+  db.prepare("DELETE FROM telegram_link_codes WHERE attempts >= 5").run();
+  return null;
+}
+
+export function logPush(db, userId, channel, digestId, status, error) {
+  return db.prepare(
+    'INSERT INTO push_log (user_id, channel, digest_id, status, error) VALUES (?, ?, ?, ?, ?)'
+  ).run(userId, channel, digestId || null, status, error || null);
+}
+
+// ── Source Weights ──
+
+export function getSubscriptionWeight(db, userId, sourceId) {
+  const row = db.prepare('SELECT weight FROM user_subscriptions WHERE user_id = ? AND source_id = ?').get(userId, sourceId);
+  return row ? row.weight : 1.0;
+}
+
+export function setSubscriptionWeight(db, userId, sourceId, weight) {
+  return db.prepare('UPDATE user_subscriptions SET weight = ? WHERE user_id = ? AND source_id = ?').run(weight, userId, sourceId);
+}
+
+export function getSubscriptionWeights(db, userId) {
+  return db.prepare(
+    'SELECT us.source_id, us.weight, s.name as source_name FROM user_subscriptions us JOIN sources s ON us.source_id = s.id WHERE us.user_id = ? AND s.is_deleted = 0'
+  ).all(userId);
+}
+
+// ── Item Feedback ──
+
+export function upsertItemFeedback(db, userId, itemUrl, itemTitle, signal) {
+  return db.prepare(
+    `INSERT INTO item_feedback (user_id, item_url, item_title, signal)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id, item_url) DO UPDATE SET signal = excluded.signal, created_at = datetime('now')`
+  ).run(userId, itemUrl, itemTitle || '', signal);
+}
+
+export function getItemFeedback(db, userId, { limit = 50 } = {}) {
+  return db.prepare(
+    'SELECT * FROM item_feedback WHERE user_id = ? ORDER BY created_at DESC LIMIT ?'
+  ).all(userId, limit);
+}
+
+export function getItemFeedbackSummary(db, userId) {
+  return db.prepare(
+    `SELECT signal, COUNT(*) as count FROM item_feedback WHERE user_id = ? GROUP BY signal`
+  ).all(userId);
+}
+
+export function getRecentHelpfulUrls(db, userId, limit = 20) {
+  return db.prepare(
+    "SELECT item_url, item_title FROM item_feedback WHERE user_id = ? AND signal = 'helpful' ORDER BY created_at DESC LIMIT ?"
+  ).all(userId, limit);
+}
+
+export function getRecentNotHelpfulUrls(db, userId, limit = 20) {
+  return db.prepare(
+    "SELECT item_url, item_title FROM item_feedback WHERE user_id = ? AND signal = 'not_helpful' ORDER BY created_at DESC LIMIT ?"
+  ).all(userId, limit);
+}
+
+// ── User Topics ──
+
+export function upsertUserTopic(db, userId, topic, score, source) {
+  return db.prepare(
+    `INSERT INTO user_topics (user_id, topic, score, source)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id, topic) DO UPDATE SET score = excluded.score, source = excluded.source, updated_at = datetime('now')`
+  ).run(userId, topic.toLowerCase().trim(), score || 1.0, source || 'manual');
+}
+
+export function removeUserTopic(db, userId, topic) {
+  return db.prepare('DELETE FROM user_topics WHERE user_id = ? AND topic = ?').run(userId, topic.toLowerCase().trim());
+}
+
+export function getUserTopics(db, userId) {
+  return db.prepare('SELECT * FROM user_topics WHERE user_id = ? ORDER BY score DESC').all(userId);
+}
+
+// ── Weighted item query for digest ──
+
+// ── Digest Cache (#45) ──
+
+export function getCachedDigest(db, hash, type, maxAgeHours = 4) {
+  return db.prepare(
+    `SELECT * FROM digest_cache WHERE hash = ? AND type = ?
+     AND created_at >= datetime('now', '-' || ? || ' hours')
+     ORDER BY created_at DESC LIMIT 1`
+  ).get(hash, type, maxAgeHours);
+}
+
+export function setCachedDigest(db, { hash, type, content, itemCount = 0, sourceCount = 0, model = null }) {
+  return db.prepare(
+    `INSERT OR REPLACE INTO digest_cache (hash, type, content, item_count, source_count, model, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`
+  ).run(hash, type, content, itemCount, sourceCount, model);
+}
+
+export function invalidateCacheForHash(db, hash) {
+  return db.prepare("DELETE FROM digest_cache WHERE hash = ?").run(hash);
+}
+
+// ── Webhooks (#42) ──
+
+export function createWebhook(db, { userId, url, secret, events }) {
+  const eventsJson = Array.isArray(events) ? JSON.stringify(events) : events;
+  const result = db.prepare(
+    'INSERT INTO webhooks (user_id, url, secret, events) VALUES (?, ?, ?, ?)'
+  ).run(userId, url, secret, eventsJson);
+  return { id: result.lastInsertRowid };
+}
+
+export function listWebhooks(db, userId) {
+  return db.prepare('SELECT id, url, events, is_active, created_at, last_triggered_at, failure_count FROM webhooks WHERE user_id = ?').all(userId);
+}
+
+export function getWebhook(db, id, userId) {
+  return db.prepare('SELECT * FROM webhooks WHERE id = ? AND user_id = ?').get(id, userId);
+}
+
+export function updateWebhook(db, id, userId, patch) {
+  const allowed = ['url', 'events', 'is_active'];
+  const sets = [];
+  const params = [];
+  for (const [k, v] of Object.entries(patch)) {
+    if (allowed.includes(k)) {
+      sets.push(`${k} = ?`);
+      params.push(k === 'events' && Array.isArray(v) ? JSON.stringify(v) : v);
+    }
+  }
+  if (!sets.length) return { changes: 0 };
+  params.push(id, userId);
+  return db.prepare(`UPDATE webhooks SET ${sets.join(', ')} WHERE id = ? AND user_id = ?`).run(...params);
+}
+
+export function deleteWebhook(db, id, userId) {
+  return db.prepare('DELETE FROM webhooks WHERE id = ? AND user_id = ?').run(id, userId);
+}
+
+export function getActiveWebhooksForEvent(db, event) {
+  return db.prepare(`
+    SELECT w.*, u.email as user_email FROM webhooks w
+    LEFT JOIN users u ON w.user_id = u.id
+    WHERE w.is_active = 1 AND w.failure_count < 5
+    AND EXISTS (
+      SELECT 1 FROM json_each(w.events) WHERE json_each.value = ? OR json_each.value = '*'
+    )
+  `).all(event);
+}
+
+export function logWebhookDelivery(db, webhookId, event, payload, status, responseBody, error) {
+  const now = status ? "datetime('now')" : null;
+  if (status) {
+    db.prepare(
+      `INSERT INTO webhook_deliveries (webhook_id, event, payload, status, response_body, delivered_at)
+       VALUES (?, ?, ?, ?, ?, datetime('now'))`
+    ).run(webhookId, event, typeof payload === 'string' ? payload : JSON.stringify(payload), status, responseBody || null);
+    db.prepare("UPDATE webhooks SET last_triggered_at = datetime('now'), failure_count = 0 WHERE id = ?").run(webhookId);
+  } else {
+    db.prepare(
+      `INSERT INTO webhook_deliveries (webhook_id, event, payload, error)
+       VALUES (?, ?, ?, ?)`
+    ).run(webhookId, event, typeof payload === 'string' ? payload : JSON.stringify(payload), error || 'unknown error');
+    db.prepare('UPDATE webhooks SET failure_count = failure_count + 1 WHERE id = ?').run(webhookId);
+  }
+}
+
+// ── API Keys (#42) ──
+
+export function createApiKey(db, { userId, keyHash, keyPrefix, name, scopes }) {
+  const scopesJson = Array.isArray(scopes) ? JSON.stringify(scopes) : scopes || '["read"]';
+  const result = db.prepare(
+    'INSERT INTO api_keys (user_id, key_hash, key_prefix, name, scopes) VALUES (?, ?, ?, ?, ?)'
+  ).run(userId, keyHash, keyPrefix, name || null, scopesJson);
+  return { id: result.lastInsertRowid };
+}
+
+export function getApiKeyByHash(db, keyHash) {
+  return db.prepare(`
+    SELECT ak.*, u.id as uid, u.email, u.name as user_name, u.slug
+    FROM api_keys ak JOIN users u ON ak.user_id = u.id
+    WHERE ak.key_hash = ? AND ak.is_active = 1
+    AND (ak.expires_at IS NULL OR ak.expires_at > datetime('now'))
+  `).get(keyHash);
+}
+
+export function listApiKeys(db, userId) {
+  return db.prepare('SELECT id, key_prefix, name, scopes, is_active, created_at, last_used_at FROM api_keys WHERE user_id = ?').all(userId);
+}
+
+export function revokeApiKey(db, id, userId) {
+  return db.prepare('UPDATE api_keys SET is_active = 0 WHERE id = ? AND user_id = ?').run(id, userId);
+}
+
+export function touchApiKeyUsed(db, id) {
+  return db.prepare("UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?").run(id);
+}
+
+export function listRawItemsForDigestWeighted(db, userId, sourceIds, { since, limit = 500 } = {}) {
+  if (!sourceIds.length) return [];
+  const placeholders = sourceIds.map(() => '?').join(',');
+  let sql = `SELECT ri.*, s.name as source_name, s.type as source_type, COALESCE(us.weight, 1.0) as source_weight
+    FROM raw_items ri
+    JOIN sources s ON ri.source_id = s.id
+    LEFT JOIN user_subscriptions us ON us.source_id = ri.source_id AND us.user_id = ?
+    WHERE ri.source_id IN (${placeholders})`;
+  const params = [userId, ...sourceIds];
+  if (since) { sql += ' AND ri.fetched_at >= ?'; params.push(since); }
+  sql += ' ORDER BY ri.fetched_at DESC LIMIT ?';
+  params.push(Math.min(limit, 1000));
+  return db.prepare(sql).all(...params);
 }
