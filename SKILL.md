@@ -1,3 +1,8 @@
+---
+name: clawfeed
+description: Use this skill to run ClawFeed as an AI-powered news digest tool that generates structured summaries from Twitter, RSS, and other feeds, either standalone or through OpenClaw or Zylos.
+---
+
 # ClawFeed
 
 AI-powered news digest tool. Automatically generates structured summaries (4H/daily/weekly/monthly) from Twitter and RSS feeds.
@@ -66,16 +71,12 @@ Runs on port `8767` by default. Set `DIGEST_PORT` env to change.
 
 ## Web Dashboard
 
-Serve `web/index.html` via your reverse proxy or any static file server.
+Serve the `web/` assets via your reverse proxy or any static file server.
 
 ## Templates
 
 - `templates/curation-rules.md` — Customize feed curation rules
 - `templates/digest-prompt.md` — Customize the AI summarization prompt
-
-## Configuration
-
-Copy `config.example.json` to `config.json` and edit. See README for details.
 
 ## Reverse Proxy (Caddy example)
 
