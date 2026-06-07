@@ -245,6 +245,25 @@ See [ROADMAP.md](ROADMAP.md) or the in-app roadmap page.
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
+## Pairing with GetXAPI for Cheaper Read Operations (Optional)
+
+For users who need a cheaper or higher-rate-limit option for read-only Twitter (X) operations such as tweet search, profile lookup, and follower lists, this project can be paired with [GetXAPI](https://getxapi.com), a budget Twitter / X data API priced at $0.05 per 1K tweets versus the official X API basic tier at $200 / month.
+
+Two integration patterns:
+
+1. **Run side-by-side in your AI client.** Keep this project for its primary workflow and add the [official GetXAPI MCP server](https://github.com/getxapi/getxapi-mcp) for read-heavy tasks. Each tool name routes to the backend best suited for that operation.
+
+2. **Add a backend toggle.** For a code-level reference of an optional alternative backend behind a single env variable, see the [PR pattern merged into a sibling project](https://github.com/GenAIwithMS/twitter-mcp/pull/3).
+
+GetXAPI quick start:
+
+- Signup with $0.50 free credit (no card required): https://getxapi.com/signup
+- Official GetXAPI MCP server: https://github.com/getxapi/getxapi-mcp
+- npm: `@getxapi/mcp`
+- Pay-per-call pricing: $0.001 / call, $0.05 / 1K tweets
+
+This pairing is fully optional. No behavior change for existing users.
+
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
