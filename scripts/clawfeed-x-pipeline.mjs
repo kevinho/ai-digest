@@ -139,6 +139,23 @@ function startBrowserSession() {
   } catch {}
 }
 
+function stopBrowserSession() {
+  const browserProfile = (process.env.CLAWFEED_X_BROWSER_PROFILE || '').trim();
+  const profileArgs = browserProfile ? ['--browser-profile', browserProfile] : [];
+  try {
+    execFileSync('openclaw', ['browser', ...profileArgs, 'stop'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'ignore', 'pipe'],
+      timeout: 45000,
+    });
+  } catch {}
+}
+
+function restartBrowserSession() {
+  stopBrowserSession();
+  startBrowserSession();
+}
+
 function focusXTab() {
   let tabs;
   try { tabs = runOpenClawBrowser(['tabs'], { timeoutMs: 30000 }).tabs || []; } catch { tabs = []; }
@@ -156,7 +173,7 @@ function evaluateOnX(fn, { timeoutMs = 120000, maxBuffer = 64 * 1024 * 1024, lab
   const retries = Math.max(0, Number(process.env.CLAWFEED_X_BROWSER_RETRIES || 2));
   let lastErr = null;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
-    if (attempt > 0) startBrowserSession();
+    if (attempt > 0) restartBrowserSession();
     try {
       focusXTab();
       return runOpenClawBrowser(['evaluate', '--fn', fn], { timeoutMs, maxBuffer }).result;
@@ -1335,11 +1352,24 @@ try {
       fetch = failedFetchResult(err, { query: args.query || 'filter:follows', lookbackHours: Number(fetchHours) || 30 });
       console.error(`[clawfeed-x-pipeline] short catch-up failed; continuing only if live popular refresh succeeds: ${fetch.error}`);
     }
-    const popularRefresh = popularRefreshFetch({ common, args, fetchHours, candidateHours });
-    if (popularRefresh && !popularRefresh.ok) {
-      throw new Error(`Popular refresh failed; refusing to rank stale rows: ${popularRefresh.error || JSON.stringify(popularRefresh)}`);
+    let popularRefresh = null;
+    try {
+      popularRefresh = popularRefreshFetch({ common, args, fetchHours, candidateHours });
+    } catch (err) {
+      popularRefresh = failedFetchResult(err, { query: `${args.query || 'filter:follows'} min_faves`, lookbackHours: Number(candidateHours) || 30 });
+      console.error(`[clawfeed-x-pipeline] popular refresh failed; falling back to stored all-following rows: ${popularRefresh.error}`);
     }
-    const popular = popularRows({ ...common, limit: args.limit || 10, hours: candidateHours, fetchedSince: runStartedAt, requireActiveSource: false });
+    const popularRefreshFailed = Boolean(popularRefresh && !popularRefresh.ok);
+    const popular = popularRows({
+      ...common,
+      limit: args.limit || 10,
+      hours: candidateHours,
+      fetchedSince: popularRefreshFailed ? null : runStartedAt,
+      requireActiveSource: popularRefreshFailed,
+    });
+    if (popularRefreshFailed) {
+      popular.fallback = 'stored all-following rows after popular refresh failure';
+    }
     if (args.json) console.log(JSON.stringify({ fetch, popularRefresh, popular }, null, 2));
     else {
       console.log('FETCH_FOLLOWING_RESULT');
