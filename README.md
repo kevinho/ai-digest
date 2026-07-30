@@ -99,7 +99,7 @@ Create a `.env` file in the project root:
 | `GOOGLE_CLIENT_ID` | Google OAuth client ID | No* | - |
 | `GOOGLE_CLIENT_SECRET` | Google OAuth client secret | No* | - |
 | `SESSION_SECRET` | Session encryption key | No* | - |
-| `API_KEY` | API key for digest creation | No | - |
+| `API_KEY` | Administrative key for digests, config, and sources | No | - |
 | `DIGEST_PORT` | Server port | No | 8767 |
 | `ALLOWED_ORIGINS` | Allowed origins for CORS | No | localhost |
 
@@ -151,11 +151,11 @@ All endpoints prefixed with `/api/`.
 
 | Method | Endpoint | Description | Auth |
 |--------|----------|-------------|------|
-| `GET` | `/api/sources` | List user's sources | Yes |
-| `POST` | `/api/sources` | Create source `{ name, type, config }` | Yes |
-| `PUT` | `/api/sources/:id` | Update source | Yes |
-| `DELETE` | `/api/sources/:id` | Soft-delete source | Yes |
-| `GET` | `/api/sources/detect` | Auto-detect source type from URL | Yes |
+| `GET` | `/api/sources` | List sources | Optional; API key lists all |
+| `POST` | `/api/sources` | Create source `{ name, type, config }` | Session or API key |
+| `PUT` | `/api/sources/:id` | Update source | Owner or API key |
+| `DELETE` | `/api/sources/:id` | Soft-delete source | Owner or API key |
+| `POST` | `/api/sources/resolve` | Auto-detect source type from URL | Session or API key |
 
 ### Source Packs
 
@@ -214,6 +214,11 @@ handle_path /digest/* {
 | `digest_feed` | ClawFeed user slug | Another user's digest |
 | `custom_api` | JSON endpoint | Custom API |
 
+ClawFeed stores source definitions and finished digests. Its current server does
+not fetch X content itself. OpenClaw users can collect public X sources with
+TweetClaw, then submit a reviewed digest through the existing API. See the
+[TweetClaw X source workflow](docs/tweetclaw-x-sources.md).
+
 ## Development
 
 ```bash
@@ -225,7 +230,7 @@ npm run dev  # Start with --watch for auto-reload
 ```bash
 cd test
 ./setup.sh    # Create test users
-./e2e.sh      # Run 66 E2E tests
+./e2e.sh      # Run 75 E2E tests
 ./teardown.sh # Clean up
 ```
 

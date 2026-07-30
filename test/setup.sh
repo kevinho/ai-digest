@@ -2,8 +2,8 @@
 # Test environment setup — creates fake users + sessions for multi-user testing
 set -e
 
-DB="${AI_DIGEST_DB:-$(dirname "$0")/../data/digest.db}"
-API="${AI_DIGEST_API:-https://digest.kevinhe.io/api}"
+DB="${AI_DIGEST_DB:-$(dirname "$0")/../data/test.db}"
+API="${AI_DIGEST_API:-http://127.0.0.1:8767/api}"
 
 echo "🧪 Setting up test environment"
 echo "   DB: $DB"
@@ -47,6 +47,6 @@ done
 echo ""
 echo "🔧 Usage:"
 echo '   ALICE="Cookie: session=test-sess-alice"'
-echo '   curl -s "$API/auth/me" -H "$ALICE"'
+echo "   curl -s \"\$API/auth/me\" -H \"\$ALICE\""
 echo ""
 echo "🧹 Teardown: bash test/teardown.sh"

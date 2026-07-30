@@ -12,7 +12,7 @@ bash test/setup.sh && bash test/e2e.sh; bash test/teardown.sh
 ```
 test/
 ├── setup.sh       # 创建 4 个测试用户 + session
-├── e2e.sh         # 57 个 E2E 用例
+├── e2e.sh         # 75 个 E2E 用例
 └── teardown.sh    # 清理所有测试数据
 ```
 
@@ -69,7 +69,7 @@ Bob (独立创建者)
 | 2.2 | Daily 列表 | 返回 daily 类型 |
 | 2.3 | Weekly 列表 | 返回 weekly 类型 |
 
-### 3. Sources CRUD + 可见性 (7 cases)
+### 3. Sources CRUD + 可见性 (16 cases)
 
 | # | 场景 | 预期 |
 |---|------|------|
@@ -80,14 +80,24 @@ Bob (独立创建者)
 | 3.5 | Visitor 看不到 private source | 不包含 "Alice Private Reddit" |
 | 3.6 | Visitor 看到 Bob 的 source | 包含 "Bob Tech Blog" |
 | 3.7 | Visitor 不能创建 source | 401 |
+| 3.8 | API key 创建 private source | 成功，返回 id |
+| 3.9 | API key 读取 private source | 返回 source |
+| 3.10 | Object config 被序列化 | 保留 endpoint |
+| 3.11 | API key 列出 private source | 列表包含 source |
+| 3.12 | Visitor 读取 private source | 404 |
+| 3.13 | API key 更新 source | 200 |
+| 3.14 | Object config 更新被序列化 | 保留新 endpoint |
+| 3.15 | 错误 API key 更新 source | 401 |
+| 3.16 | API key 删除 source | 200 |
 
-### 4. Source 所有权 (3 cases)
+### 4. Source 所有权 (4 cases)
 
 | # | 场景 | 预期 |
 |---|------|------|
 | 4.1 | Bob 删 Alice 的 source | 403 |
 | 4.2 | Alice 删自己的 private source | 成功 |
-| 4.3 | Alice 订阅数减 1 | 2 |
+| 4.3 | Alice 保留 soft-deleted 订阅 | 3 |
+| 4.4 | 已删除订阅标记 | `sourceDeleted=true` |
 
 ### 5. Pack 创建 + 分享 (4 cases)
 
@@ -103,9 +113,10 @@ Bob (独立创建者)
 | # | 场景 | 预期 |
 |---|------|------|
 | 6.1 | Carol 初始 0 订阅 | subscriptions = 0 |
-| 6.2 | Carol 安装 Alice 的 pack | ok, added=2 |
-| 6.3 | Carol 订阅了 RSS | 包含 "Alice Public RSS" |
-| 6.4 | Carol 订阅了 HN | 包含 "Alice Public HN" |
+| 6.2 | Carol 安装 Alice 的 pack | ok |
+| 6.3 | 安装结果 | added=2 |
+| 6.4 | Carol 订阅了 RSS | 包含 "Alice Public RSS" |
+| 6.5 | Carol 订阅了 HN | 包含 "Alice Public HN" |
 
 ### 7. Pack 去重 (2 cases)
 
@@ -133,11 +144,13 @@ Bob (独立创建者)
 |---|------|------|
 | 10.1 | Alice 标记一篇 | 成功 |
 | 10.2 | Bob 标记同一篇 | 成功 |
-| 10.3 | Alice 只看到自己的 | 包含 alice，不包含 bob |
-| 10.4 | Bob 只看到自己的 | 包含 bob，不包含 alice |
-| 10.5 | Carol 没有 marks | 0 |
-| 10.6 | Visitor 不能看 marks | 401 |
-| 10.7 | Alice 删除 mark | 成功 |
+| 10.3 | Alice 看到自己的 mark | 包含 alice |
+| 10.4 | Alice 看不到 Bob 的 mark | 不包含 bob |
+| 10.5 | Bob 看到自己的 mark | 包含 bob |
+| 10.6 | Bob 看不到 Alice 的 mark | 不包含 alice |
+| 10.7 | Carol 没有 marks | 0 |
+| 10.8 | Visitor 不能看 marks | 401 |
+| 10.9 | Alice 删除 mark | 成功 |
 
 ### 11. 数据隔离 (2 cases)
 
@@ -150,9 +163,10 @@ Bob (独立创建者)
 
 | # | 场景 | 预期 |
 |---|------|------|
-| 12.1 | JSON Feed | 200, 含 "version" |
-| 12.2 | RSS Feed | 200 |
-| 12.3 | 无效 slug | 404 |
+| 12.1 | JSON Feed | 200 |
+| 12.2 | JSON Feed 格式 | 含 "version" |
+| 12.3 | RSS Feed | 200 |
+| 12.4 | 无效 slug | 404 |
 
 ### 13. API 安全 (5 cases)
 
@@ -171,12 +185,25 @@ Bob (独立创建者)
 | 14.1 | 三次安装同一 pack | idempotent, added=0 |
 | 14.2 | 重复订阅同一 source | 不报错 |
 
-### 15. Source 删除级联 (2 cases)
+### 15. Source 删除级联 (3 cases)
 
 | # | 场景 | 预期 |
 |---|------|------|
-| 15.1 | Alice 删 source → Carol 丢订阅 | Carol subs - 1 |
-| 15.2 | Pack 仍然存在（JSON 快照） | pack 可查询 |
+| 15.1 | Alice soft-delete source | Carol 保留订阅 |
+| 15.2 | Carol 看到删除标记 | `sourceDeleted=true` |
+| 15.3 | Pack 仍然存在（JSON 快照） | pack 可查询 |
+
+### 16. Soft Delete (7 cases)
+
+| # | 场景 | 预期 |
+|---|------|------|
+| 16.1 | Soft delete 设置 `is_deleted=1` | 数据保留 |
+| 16.2 | Sources 列表隐藏已删除 source | 不返回 |
+| 16.3 | Subscriber 看到删除标记 | `sourceDeleted=true` |
+| 16.4 | Pack 安装跳过已删除 source | added=0 |
+| 16.5 | Mixed pack 只添加有效 source | added=1 |
+| 16.6 | 重装 deleted-source pack | added=0 |
+| 16.7 | Active sources 不含已删除 source | 不返回 |
 
 ## 已知问题 (TODO)
 
@@ -191,9 +218,14 @@ Bob (独立创建者)
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `AI_DIGEST_DB` | `../data/digest.db` (相对 test/) | SQLite 数据库路径 |
-| `AI_DIGEST_API` | `https://digest.kevinhe.io/api` | API base URL |
-| `AI_DIGEST_FEED` | `https://digest.kevinhe.io/feed` | Feed base URL |
+| `AI_DIGEST_DB` | `../data/test.db` (相对 test/) | 隔离的 SQLite 测试数据库 |
+| `AI_DIGEST_API` | `http://127.0.0.1:8767/api` | API base URL |
+| `AI_DIGEST_FEED` | `http://127.0.0.1:8767/feed` | Feed base URL |
+| `API_KEY` | 未设置 | 运行 9 个 API-key source 管理用例 |
+| `ALLOW_REMOTE_E2E` | `0` | 仅对隔离的非生产远程环境设为 `1` |
+
+E2E 测试会创建、修改并删除数据，因此默认拒绝非本机 API。不要对生产环境
+设置 `ALLOW_REMOTE_E2E=1`。
 
 ### 本地开发测试
 

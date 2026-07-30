@@ -281,10 +281,20 @@ export function getSource(db, id) {
   return db.prepare('SELECT * FROM sources WHERE id = ?').get(id);
 }
 
-export function createSource(db, { name, type, config = '{}', isPublic = 0, createdBy }) {
+function serializeSourceConfig(config) {
+  return typeof config === 'string' ? config : JSON.stringify(config ?? {});
+}
+
+function serializeSourceValue(column, value) {
+  if (column === 'config') return serializeSourceConfig(value);
+  if (typeof value === 'boolean') return value ? 1 : 0;
+  return value;
+}
+
+export function createSource(db, { name, type, config = '{}', isPublic = 0, createdBy = null }) {
   const result = db.prepare(
     'INSERT INTO sources (name, type, config, is_public, created_by) VALUES (?, ?, ?, ?, ?)'
-  ).run(name, type, config, isPublic ? 1 : 0, createdBy);
+  ).run(name, type, serializeSourceConfig(config), isPublic ? 1 : 0, createdBy);
   const sourceId = result.lastInsertRowid;
   // Auto-subscribe creator
   if (createdBy) {
@@ -299,11 +309,13 @@ export function updateSource(db, id, patch) {
   const allowed = ['name', 'type', 'config', 'is_active', 'is_public'];
   const sets = [];
   const params = [];
-  for (const [k, v] of Object.entries(patch)) {
-    const col = k === 'isActive' ? 'is_active' : k === 'isPublic' ? 'is_public' : k;
-    if (allowed.includes(col)) {
-      sets.push(`${col} = ?`);
-      params.push(typeof v === 'boolean' ? (v ? 1 : 0) : v);
+  for (const [key, value] of Object.entries(patch)) {
+    let column = key;
+    if (key === 'isActive') column = 'is_active';
+    if (key === 'isPublic') column = 'is_public';
+    if (allowed.includes(column)) {
+      sets.push(`${column} = ?`);
+      params.push(serializeSourceValue(column, value));
     }
   }
   if (!sets.length) return { changes: 0 };
@@ -312,8 +324,8 @@ export function updateSource(db, id, patch) {
   return db.prepare(`UPDATE sources SET ${sets.join(', ')} WHERE id = ?`).run(...params);
 }
 
-export function deleteSource(db, id, userId) {
-  if (userId) {
+export function deleteSource(db, id, userId = null) {
+  if (userId !== null) {
     return db.prepare("UPDATE sources SET is_deleted = 1, deleted_at = datetime('now') WHERE id = ? AND created_by = ?").run(id, userId);
   }
   return db.prepare("UPDATE sources SET is_deleted = 1, deleted_at = datetime('now') WHERE id = ?").run(id);
