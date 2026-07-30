@@ -203,6 +203,15 @@ function attachUser(req) {
   }
 }
 
+function hasApiKey(req) {
+  const authHeader = req.headers.authorization || '';
+  if (!API_KEY || !authHeader.startsWith('Bearer ')) return false;
+
+  const supplied = Buffer.from(authHeader.slice(7));
+  const expected = Buffer.from(API_KEY);
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+}
+
 function _digestTitle(d, ca) {
   const dt = new Date(ca.includes('+') ? ca : ca.replace(' ', 'T') + '+08:00');
   const timeStr = dt.toLocaleString('en-SG', { timeZone: 'Asia/Singapore', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
@@ -417,6 +426,7 @@ const server = createServer(async (req, res) => {
   }
 
   attachUser(req);
+  const apiKeyAuthorized = hasApiKey(req);
 
   try {
     // ── Auth endpoints ──
@@ -528,9 +538,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && path === '/api/digests') {
-      const authHeader = req.headers.authorization || '';
-      const bearerKey = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-      if (!API_KEY || bearerKey !== API_KEY) return json(res, { error: 'invalid api key' }, 401);
+      if (!apiKeyAuthorized) return json(res, { error: 'invalid api key' }, 401);
       const body = await parseBody(req);
       const result = createDigest(db, body);
       return json(res, result, 201);
@@ -614,7 +622,7 @@ const server = createServer(async (req, res) => {
 
     // ── Source resolve endpoint ──
     if (req.method === 'POST' && path === '/api/sources/resolve') {
-      if (!req.user) return json(res, { error: 'login required' }, 401);
+      if (!req.user && !apiKeyAuthorized) return json(res, { error: 'login required' }, 401);
       const body = await parseBody(req);
       const url = (body.url || '').trim();
       if (!url) return json(res, { error: 'url required' }, 400);
@@ -630,7 +638,9 @@ const server = createServer(async (req, res) => {
     // ── Sources endpoints ──
 
     if (req.method === 'GET' && path === '/api/sources') {
-      if (req.user) {
+      if (apiKeyAuthorized) {
+        return json(res, listSources(db));
+      } else if (req.user) {
         const sources = listSources(db, { userId: req.user.id, includePublic: true });
         // Add subscribed field
         const subs = new Set(listSubscriptions(db, req.user.id).map(s => s.id));
@@ -644,35 +654,35 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && sourceMatch) {
       const s = getSource(db, parseInt(sourceMatch[1]));
       if (!s) return json(res, { error: 'not found' }, 404);
-      if (!s.is_public && (!req.user || s.created_by !== req.user.id)) {
+      if (!s.is_public && !apiKeyAuthorized && (!req.user || s.created_by !== req.user.id)) {
         return json(res, { error: 'not found' }, 404);
       }
       return json(res, s);
     }
 
     if (req.method === 'POST' && path === '/api/sources') {
-      if (!req.user) return json(res, { error: 'login required' }, 401);
+      if (!req.user && !apiKeyAuthorized) return json(res, { error: 'login required' }, 401);
       const body = await parseBody(req);
-      const result = createSource(db, { ...body, createdBy: req.user.id });
+      const result = createSource(db, { ...body, createdBy: req.user?.id });
       return json(res, result, 201);
     }
 
     if (req.method === 'PUT' && sourceMatch) {
-      if (!req.user) return json(res, { error: 'login required' }, 401);
+      if (!req.user && !apiKeyAuthorized) return json(res, { error: 'login required' }, 401);
       const s = getSource(db, parseInt(sourceMatch[1]));
       if (!s) return json(res, { error: 'not found' }, 404);
-      if (s.created_by !== req.user.id) return json(res, { error: 'forbidden' }, 403);
+      if (!apiKeyAuthorized && s.created_by !== req.user.id) return json(res, { error: 'forbidden' }, 403);
       const body = await parseBody(req);
       updateSource(db, parseInt(sourceMatch[1]), body);
       return json(res, { ok: true });
     }
 
     if (req.method === 'DELETE' && sourceMatch) {
-      if (!req.user) return json(res, { error: 'login required' }, 401);
+      if (!req.user && !apiKeyAuthorized) return json(res, { error: 'login required' }, 401);
       const s = getSource(db, parseInt(sourceMatch[1]));
       if (!s) return json(res, { error: 'not found' }, 404);
-      if (s.created_by !== req.user.id) return json(res, { error: 'forbidden' }, 403);
-      deleteSource(db, parseInt(sourceMatch[1]), req.user.id);
+      if (!apiKeyAuthorized && s.created_by !== req.user.id) return json(res, { error: 'forbidden' }, 403);
+      deleteSource(db, parseInt(sourceMatch[1]), apiKeyAuthorized ? null : req.user.id);
       return json(res, { ok: true });
     }
 
@@ -848,9 +858,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'PUT' && path === '/api/config') {
-      const authHeader = req.headers.authorization || '';
-      const bearerKey = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-      if (!API_KEY || bearerKey !== API_KEY) return json(res, { error: 'invalid api key' }, 401);
+      if (!apiKeyAuthorized) return json(res, { error: 'invalid api key' }, 401);
       const body = await parseBody(req);
       for (const [k, v] of Object.entries(body)) setConfig(db, k, v);
       return json(res, { ok: true });

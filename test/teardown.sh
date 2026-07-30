@@ -2,7 +2,7 @@
 # Clean up all test data — removes test users and everything they created
 set -e
 
-DB="${AI_DIGEST_DB:-$(dirname "$0")/../data/digest.db}"
+DB="${AI_DIGEST_DB:-$(dirname "$0")/../data/test.db}"
 
 echo "🧹 Tearing down test environment"
 

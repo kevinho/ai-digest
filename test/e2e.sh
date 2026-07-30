@@ -7,15 +7,44 @@
 # ═══════════════════════════════════════════════════
 set -e
 
-API="${AI_DIGEST_API:-https://digest.kevinhe.io/api}"
-FEED="${AI_DIGEST_FEED:-https://digest.kevinhe.io/feed}"
+API="${AI_DIGEST_API:-http://127.0.0.1:8767/api}"
+FEED="${AI_DIGEST_FEED:-http://127.0.0.1:8767/feed}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-AI_DIGEST_DB="${AI_DIGEST_DB:-$SCRIPT_DIR/../data/digest.db}"
+AI_DIGEST_DB="${AI_DIGEST_DB:-$SCRIPT_DIR/../data/test.db}"
+ALLOW_REMOTE_E2E="${ALLOW_REMOTE_E2E:-0}"
 ALICE="Cookie: session=test-sess-alice"
 BOB="Cookie: session=test-sess-bob"
 CAROL="Cookie: session=test-sess-carol"
 DAVE="Cookie: session=test-sess-dave"
 PASS=0; FAIL=0; TOTAL=0; SKIP=0
+
+is_loopback_url() {
+  python3 - "$1" <<'PY'
+import ipaddress
+import sys
+from urllib.parse import urlsplit
+
+try:
+    url = urlsplit(sys.argv[1])
+    host = url.hostname
+except ValueError:
+    raise SystemExit(1)
+if url.scheme not in {"http", "https"} or url.username is not None or not host:
+    raise SystemExit(1)
+if host == "localhost":
+    raise SystemExit(0)
+try:
+    raise SystemExit(0 if ipaddress.ip_address(host).is_loopback else 1)
+except ValueError:
+    raise SystemExit(1)
+PY
+}
+
+if ! is_loopback_url "$API" && [ "$ALLOW_REMOTE_E2E" != "1" ]; then
+  echo "Refusing remote E2E target: $API"
+  echo "Set ALLOW_REMOTE_E2E=1 only for an isolated non-production environment."
+  exit 2
+fi
 
 check() {
   TOTAL=$((TOTAL+1))
@@ -120,6 +149,32 @@ check "Visitor sees Bob's source" 'Bob Tech Blog' "$r"
 
 # Security: visitor can't create
 check_code "Visitor cannot create → 401" "401" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/sources" -H 'Content-Type: application/json' -d '{"name":"x","type":"rss","config":"{}"}')"
+
+# Server API keys can administer sources without a Google OAuth session.
+if [ -n "${API_KEY:-}" ]; then
+  AGENT_AUTH="Authorization: Bearer $API_KEY"
+  AGENT_SOURCE=$(curl -s -X POST "$API/sources" -H "$AGENT_AUTH" -H "Content-Type: application/json" \
+    -d '{"name":"Agent Private Source","type":"custom_api","config":{"endpoint":"https://example.test/feed"},"isPublic":false}' \
+    | jq_val "d['id']")
+  check "API key creates source with object config" "$AGENT_SOURCE" "$AGENT_SOURCE"
+  AGENT_SOURCE_RESPONSE=$(curl -s "$API/sources/$AGENT_SOURCE" -H "$AGENT_AUTH")
+  check "API key reads private source" 'Agent Private Source' "$AGENT_SOURCE_RESPONSE"
+  check "Object config is serialized" 'example.test/feed' "$AGENT_SOURCE_RESPONSE"
+  check "API key lists private source" 'Agent Private Source' "$(curl -s "$API/sources" -H "$AGENT_AUTH")"
+  check_code "Visitor cannot read API-key private source → 404" "404" \
+    "$(curl -s -o /dev/null -w '%{http_code}' "$API/sources/$AGENT_SOURCE")"
+  check_code "API key updates source → 200" "200" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$API/sources/$AGENT_SOURCE" -H "$AGENT_AUTH" -H "Content-Type: application/json" -d '{"name":"Agent Updated Source","config":{"endpoint":"https://example.test/updated"}}')"
+  check "API key update serializes object config" 'example.test/updated' \
+    "$(curl -s "$API/sources/$AGENT_SOURCE" -H "$AGENT_AUTH")"
+  check_code "Wrong API key cannot update source → 401" "401" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$API/sources/$AGENT_SOURCE" -H 'Authorization: Bearer wrong-key' -H "Content-Type: application/json" -d '{"name":"Wrong"}')"
+  check_code "API key deletes source → 200" "200" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$API/sources/$AGENT_SOURCE" -H "$AGENT_AUTH")"
+else
+  echo "  ⏭️  Skipping API-key source tests (API_KEY is unset)"
+  SKIP=$((SKIP+9))
+fi
 
 # ═══════════════════════════════════════════
 # 4. SOURCE OWNERSHIP

@@ -6,24 +6,24 @@
 |---------|----------|-------|--------|
 | [1](#1-authentication-6-tests) | Authentication | 6 | ✅ |
 | [2](#2-digest-browsing--public-3-tests) | Digest Browsing (public) | 3 | ✅ |
-| [3](#3-sources--crud--visibility-6-tests) | Sources CRUD + Visibility | 6 | ✅ |
-| [4](#4-source-ownership-3-tests) | Source Ownership | 3 | ✅ |
+| [3](#3-sources--crud--visibility-16-tests) | Sources CRUD + Visibility | 16 | ✅ |
+| [4](#4-source-ownership-4-tests) | Source Ownership | 4 | ✅ |
 | [5](#5-packs--create--share-4-tests) | Packs Create + Share | 4 | ✅ |
-| [6](#6-pack-install--fresh-user-4-tests) | Pack Install (fresh user) | 4 | ✅ |
+| [6](#6-pack-install--fresh-user-5-tests) | Pack Install (fresh user) | 5 | ✅ |
 | [7](#7-pack-dedup-2-tests) | Pack Dedup | 2 | ✅ |
 | [8](#8-cross-install-with-overlap-1-test) | Cross-Install Overlap | 1 | ✅ |
 | [9](#9-subscription-management-2-tests) | Subscription Management | 2 | ✅ |
-| [10](#10-marks--crud--isolation-7-tests) | Marks CRUD + Isolation | 7 | ✅ |
+| [10](#10-marks--crud--isolation-9-tests) | Marks CRUD + Isolation | 9 | ✅ |
 | [11](#11-data-isolation-2-tests) | Data Isolation | 2 | ✅ |
 | [12](#12-feed-output-4-tests) | Feed Output | 4 | ✅ |
 | [13](#13-api-security-5-tests) | API Security | 5 | ✅ |
-| [14](#14-edge-cases-3-tests) | Edge Cases | 3+ | ✅ |
-| [15](#15-source-deletion--subscriber-impact-2-tests) | Source Deletion Cascade | 2 | ✅ |
-| [16](#16-soft-delete-sources-planned) | Soft Delete Sources | 7 | 🔜 |
+| [14](#14-edge-cases-2-tests--2-diagnostics) | Edge Cases | 2 + 2 diagnostics | ✅ |
+| [15](#15-source-deletion--subscriber-impact-3-tests) | Source Deletion Cascade | 3 | ✅ |
+| [16](#16-soft-delete-sources-7-tests) | Soft Delete Sources | 7 | ✅ |
 | [17](#17-source-dedup-at-scale-planned) | Source Dedup at Scale | 5 | 🔜 |
 | [18](#18-subscription-volume-planned) | Subscription Volume | 3 | 🔜 |
 
-**Total: 52 active ✅ + 15 planned 🔜 = 67**
+**Total: 75 active ✅ + 8 planned 🔜 = 83**
 
 ---
 
@@ -44,9 +44,11 @@ bash test/teardown.sh
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AI_DIGEST_API` | `https://digest.kevinhe.io/api` | API base URL |
-| `AI_DIGEST_FEED` | `https://digest.kevinhe.io/feed` | Feed base URL |
-| `AI_DIGEST_DB` | `../data/digest.db` (relative) | SQLite DB path |
+| `AI_DIGEST_API` | `http://127.0.0.1:8767/api` | API base URL |
+| `AI_DIGEST_FEED` | `http://127.0.0.1:8767/feed` | Feed base URL |
+| `AI_DIGEST_DB` | `../data/test.db` (relative) | Isolated SQLite test DB |
+| `API_KEY` | unset | Run the 9 API-key source administration tests |
+| `ALLOW_REMOTE_E2E` | `0` | Permit an explicitly isolated remote target |
 
 ### Local Testing
 
@@ -55,6 +57,10 @@ AI_DIGEST_API=http://localhost:8767/api \
 AI_DIGEST_FEED=http://localhost:8767/feed \
 bash test/e2e.sh
 ```
+
+The suite refuses non-loopback API targets by default because it creates,
+updates, and deletes data. Set `ALLOW_REMOTE_E2E=1` only for an isolated
+non-production environment.
 
 ---
 
@@ -90,22 +96,33 @@ ID range 100–199 reserved for test data; teardown cleans by range.
 | 2.2 | Daily digest list | `GET /digests?type=daily` |
 | 2.3 | Weekly digest list | `GET /digests?type=weekly` |
 
-### 3. Sources — CRUD + Visibility (6 tests)
+### 3. Sources — CRUD + Visibility (16 tests)
 | # | Case | Method |
 |---|------|--------|
 | 3.1 | Alice creates 3 sources (2 public, 1 private) | `POST /sources` ×3 |
 | 3.2 | Alice auto-subscribed to all 3 | `GET /subscriptions` |
 | 3.3 | Bob creates 1 public source | `POST /sources` |
-| 3.4 | Visitor sees public sources | `GET /sources` |
+| 3.4 | Visitor sees Alice's public sources | `GET /sources` |
 | 3.5 | Visitor cannot see private sources | `GET /sources` (negative) |
-| 3.6 | Visitor cannot create sources → 401 | `POST /sources` |
+| 3.6 | Visitor sees Bob's public source | `GET /sources` |
+| 3.7 | Visitor cannot create sources → 401 | `POST /sources` |
+| 3.8 | API key creates a private source | `POST /sources` |
+| 3.9 | API key reads the private source | `GET /sources/:id` |
+| 3.10 | Object config is serialized | `GET /sources/:id` |
+| 3.11 | API key lists the private source | `GET /sources` |
+| 3.12 | Visitor cannot read the private source → 404 | `GET /sources/:id` |
+| 3.13 | API key updates the source | `PUT /sources/:id` |
+| 3.14 | Object config update is serialized | `GET /sources/:id` |
+| 3.15 | Wrong API key cannot update the source → 401 | `PUT /sources/:id` |
+| 3.16 | API key deletes the source | `DELETE /sources/:id` |
 
-### 4. Source Ownership (3 tests)
+### 4. Source Ownership (4 tests)
 | # | Case | Method |
 |---|------|--------|
 | 4.1 | Bob cannot delete Alice's source → 403 | `DELETE /sources/:id` |
 | 4.2 | Alice deletes her private source | `DELETE /sources/:id` |
-| 4.3 | Alice's subscription count decreases | `GET /subscriptions` |
+| 4.3 | Alice retains the soft-deleted subscription | `GET /subscriptions` |
+| 4.4 | Deleted subscription exposes `sourceDeleted` | `GET /subscriptions` |
 
 ### 5. Packs — Create + Share (4 tests)
 | # | Case | Method |
@@ -115,13 +132,14 @@ ID range 100–199 reserved for test data; teardown cleans by range.
 | 5.3 | Pack detail accessible | `GET /packs/:slug` |
 | 5.4 | Visitor cannot install pack → 401 | `POST /packs/:slug/install` |
 
-### 6. Pack Install — Fresh User (4 tests)
+### 6. Pack Install — Fresh User (5 tests)
 | # | Case | Method |
 |---|------|--------|
 | 6.1 | Carol starts with 0 subscriptions | `GET /subscriptions` |
-| 6.2 | Carol installs Alice's pack → added 2 | `POST /packs/:slug/install` |
-| 6.3 | Carol subscribed to Alice's RSS | `GET /subscriptions` |
-| 6.4 | Carol subscribed to Alice's HN | `GET /subscriptions` |
+| 6.2 | Carol installs Alice's pack | `POST /packs/:slug/install` |
+| 6.3 | Install reports 2 added sources | `POST /packs/:slug/install` |
+| 6.4 | Carol subscribed to Alice's RSS | `GET /subscriptions` |
+| 6.5 | Carol subscribed to Alice's HN | `GET /subscriptions` |
 
 ### 7. Pack Dedup (2 tests)
 | # | Case | Method |
@@ -140,16 +158,18 @@ ID range 100–199 reserved for test data; teardown cleans by range.
 | 9.1 | Carol unsubscribes → count decreases | `DELETE /subscriptions/:sourceId` |
 | 9.2 | Carol re-subscribes → count restores | `POST /subscriptions` |
 
-### 10. Marks — CRUD + Isolation (7 tests)
+### 10. Marks — CRUD + Isolation (9 tests)
 | # | Case | Method |
 |---|------|--------|
 | 10.1 | Alice creates mark | `POST /marks` |
 | 10.2 | Bob creates mark on same digest | `POST /marks` |
-| 10.3 | Alice sees only her marks | `GET /marks` |
-| 10.4 | Alice cannot see Bob's marks | `GET /marks` (negative) |
-| 10.5 | Bob cannot see Alice's marks | `GET /marks` (negative) |
-| 10.6 | Carol has 0 marks | `GET /marks` |
-| 10.7 | Visitor → 401 | `GET /marks` |
+| 10.3 | Alice sees her mark | `GET /marks` |
+| 10.4 | Alice cannot see Bob's mark | `GET /marks` (negative) |
+| 10.5 | Bob sees his mark | `GET /marks` |
+| 10.6 | Bob cannot see Alice's mark | `GET /marks` (negative) |
+| 10.7 | Carol has 0 marks | `GET /marks` |
+| 10.8 | Visitor → 401 | `GET /marks` |
+| 10.9 | Alice deletes her mark | `DELETE /marks/:id` |
 
 ### 11. Data Isolation (2 tests)
 | # | Case | Method |
@@ -174,7 +194,7 @@ ID range 100–199 reserved for test data; teardown cleans by range.
 | 13.4 | Delete source without login → 401 | `DELETE /sources/:id` |
 | 13.5 | Access marks without login → 401 | `GET /marks` |
 
-### 14. Edge Cases (3+ tests)
+### 14. Edge Cases (2 tests + 2 diagnostics)
 | # | Case | Method |
 |---|------|--------|
 | 14.1 | Triple-install is idempotent | `POST /packs/:slug/install` |
@@ -182,17 +202,18 @@ ID range 100–199 reserved for test data; teardown cleans by range.
 | 14.3 | Subscribe to nonexistent source | `POST /subscriptions` |
 | 14.4 | Create source with empty name | `POST /sources` (TODO: validate) |
 
-### 15. Source Deletion + Subscriber Impact (2 tests)
+### 15. Source Deletion + Subscriber Impact (3 tests)
 | # | Case | Method |
 |---|------|--------|
-| 15.1 | Alice deletes source → Carol loses subscription | `DELETE /sources/:id` |
-| 15.2 | Pack still exists after source deleted (stale) | `GET /packs/:slug` |
+| 15.1 | Alice soft-deletes source → Carol keeps subscription | `DELETE /sources/:id` |
+| 15.2 | Carol sees the source as deleted | `GET /subscriptions` |
+| 15.3 | Pack still exists after source deletion | `GET /packs/:slug` |
 
-**Total: ~52 test assertions**
+**Total: 75 test assertions**
 
 ---
 
-### 16. Soft Delete Sources (planned)
+### 16. Soft Delete Sources (7 tests)
 | # | Case | Method |
 |---|------|--------|
 | 16.1 | Delete source → `is_deleted=1`, not removed from DB | `DELETE /sources/:id` |
@@ -201,7 +222,7 @@ ID range 100–199 reserved for test data; teardown cleans by range.
 | 16.4 | Pack install skips deleted source (no zombie) | `POST /packs/:slug/install` |
 | 16.5 | Pack install skips deleted, creates non-deleted only | `POST /packs/:slug/install` (mixed) |
 | 16.6 | Re-install after source deleted → 0 added (not recreated) | `POST /packs/:slug/install` |
-| 16.7 | Deleted source not in feed output | `GET /feed/:slug.json` |
+| 16.7 | Deleted source is absent from active sources | `GET /sources` |
 
 ### 17. Source Dedup at Scale (planned)
 | # | Case | Method |
